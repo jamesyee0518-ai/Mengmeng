@@ -1,0 +1,37 @@
+# macOS
+.DS_Store
+**/.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Logs
+*.log
+
+# IDE
+.idea/
+*.iml
+
+# Flutter / Dart
+**/.dart_tool/
+**/.flutter-plugins
+**/.flutter-plugins-dependencies
+**/.packages
+**/build/
+**/.pub-cache/
+**/.pub/
+**/coverage/
+**/ios/Flutter/.last_build_id
+
+# Android generated outputs
+**/android/app/debug/
+**/android/app/profile/
+**/android/app/release/
+
+# Local secrets / environment
+.env
+.env.*
+!.env.example

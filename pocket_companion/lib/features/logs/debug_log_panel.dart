@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 
 import '../../core/logging/debug_log_entry.dart';
 import '../../core/logging/debug_log_store.dart';
@@ -24,6 +25,23 @@ class DebugLogPanel extends StatelessWidget {
                 const SizedBox(width: 8),
                 Text('日志', style: Theme.of(context).textTheme.titleMedium),
                 const Spacer(),
+                Tooltip(
+                  message: '复制日志',
+                  child: IconButton(
+                    key: const ValueKey('copyLogs'),
+                    onPressed: () async {
+                      await Clipboard.setData(
+                        ClipboardData(text: store.exportText()),
+                      );
+                      if (context.mounted) {
+                        ScaffoldMessenger.of(context).showSnackBar(
+                          const SnackBar(content: Text('日志已复制')),
+                        );
+                      }
+                    },
+                    icon: const Icon(Icons.copy),
+                  ),
+                ),
                 Tooltip(
                   message: '清空日志',
                   child: IconButton(

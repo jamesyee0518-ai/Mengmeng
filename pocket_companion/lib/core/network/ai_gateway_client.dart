@@ -7,7 +7,9 @@ import '../../features/settings/companion_settings.dart';
 import 'robot_http_transport.dart';
 
 class AiGatewayClient {
-  static const Duration modelResponseTimeout = Duration(seconds: 75);
+  static const Duration healthTimeout = Duration(seconds: 2);
+  static const Duration chatTimeout = Duration(seconds: 90);
+  static const Duration visionTimeout = Duration(seconds: 120);
 
   AiGatewayClient({
     this.baseUrl = const String.fromEnvironment(
@@ -24,10 +26,29 @@ class AiGatewayClient {
 
   Future<bool> health() async {
     try {
-      final response = await _transport.get(_uri('/health'));
+      final response = await _transport.get(
+        _uri('/health'),
+        timeout: healthTimeout,
+      );
       return response.statusCode >= 200 && response.statusCode < 300;
     } catch (_) {
       return false;
+    }
+  }
+
+  Future<Map<String, dynamic>?> diagnostics() async {
+    try {
+      final response = await _transport.get(
+        _uri('/diagnostics'),
+        timeout: const Duration(seconds: 8),
+      );
+      if (response.statusCode < 200 || response.statusCode >= 300) {
+        return null;
+      }
+      final decoded = jsonDecode(response.body);
+      return decoded is Map<String, dynamic> ? decoded : null;
+    } catch (_) {
+      return null;
     }
   }
 
@@ -36,11 +57,14 @@ class AiGatewayClient {
     CompanionSettings? settings,
     String? persona,
   }) async {
-    return _postRobotResponse('/chat', {
-      'text': text,
-      if (persona != null) 'persona': persona,
-      if (settings != null) 'settings': settings.toGatewayPayload(),
-    });
+    final payload = <String, Object?>{'text': text};
+    if (persona != null) {
+      payload['persona'] = persona;
+    }
+    if (settings != null) {
+      payload['settings'] = settings.toGatewayPayload();
+    }
+    return _postRobotResponse('/chat', payload, timeout: chatTimeout);
   }
 
   Future<RobotResponse> vision(
@@ -49,12 +73,39 @@ class AiGatewayClient {
     CompanionSettings? settings,
     String? persona,
   }) async {
-    return _postRobotResponse('/vision', {
+    final payload = <String, Object?>{
       'image_base64': base64Encode(imageBytes),
       'prompt': prompt,
-      if (persona != null) 'persona': persona,
-      if (settings != null) 'settings': settings.toGatewayPayload(),
-    });
+    };
+    if (persona != null) {
+      payload['persona'] = persona;
+    }
+    if (settings != null) {
+      payload['settings'] = settings.toGatewayPayload();
+    }
+    return _postRobotResponse('/vision', payload, timeout: visionTimeout);
+  }
+
+  /// 语音+视觉合并：文本对话中附带图片，由Gateway决定是否使用视觉内容
+  Future<RobotResponse> chatWithVision(
+    String text,
+    List<int> imageBytes, {
+    String mimeType = 'image/jpeg',
+    CompanionSettings? settings,
+    String? persona,
+  }) async {
+    final payload = <String, Object?>{
+      'text': text,
+      'image_base64': base64Encode(imageBytes),
+      'mime_type': mimeType,
+    };
+    if (persona != null) {
+      payload['persona'] = persona;
+    }
+    if (settings != null) {
+      payload['settings'] = settings.toGatewayPayload();
+    }
+    return _postRobotResponse('/chat/vision', payload, timeout: visionTimeout);
   }
 
   Future<RobotResponse> event(
@@ -64,24 +115,32 @@ class AiGatewayClient {
     String? persona,
     String? source,
   }) async {
-    return _postRobotResponse('/event', {
-      'type': type,
-      if (source != null) 'source': source,
-      if (persona != null) 'persona': persona,
-      if (deviceEvent != null) ...deviceEvent.toGatewayPayload(),
-      if (settings != null) 'settings': settings.toGatewayPayload(),
-    });
+    final payload = <String, Object?>{'type': type};
+    if (source != null) {
+      payload['source'] = source;
+    }
+    if (persona != null) {
+      payload['persona'] = persona;
+    }
+    if (deviceEvent != null) {
+      payload.addAll(deviceEvent.toGatewayPayload());
+    }
+    if (settings != null) {
+      payload['settings'] = settings.toGatewayPayload();
+    }
+    return _postRobotResponse('/event', payload);
   }
 
   Future<RobotResponse> _postRobotResponse(
     String path,
-    Map<String, Object?> payload,
-  ) async {
+    Map<String, Object?> payload, {
+    Duration timeout = chatTimeout,
+  }) async {
     try {
       final response = await _transport.postJson(
         _uri(path),
         jsonEncode(payload),
-        timeout: modelResponseTimeout,
+        timeout: timeout,
       );
       if (response.statusCode < 200 || response.statusCode >= 300) {
         return RobotResponse.fallback(reason: 'http_${response.statusCode}');

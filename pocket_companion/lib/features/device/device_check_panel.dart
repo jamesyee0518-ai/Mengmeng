@@ -3,6 +3,7 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 
 import '../../core/logging/debug_log_store.dart';
+import '../../core/network/ai_gateway_client.dart';
 import '../settings/companion_settings.dart';
 import '../vision/vision_service.dart';
 import '../voice/speech_service.dart';
@@ -13,6 +14,7 @@ import 'device_event_service.dart';
 class DeviceCheckPanel extends StatefulWidget {
   const DeviceCheckPanel({
     super.key,
+    required this.gateway,
     required this.deviceEvents,
     required this.speech,
     required this.vision,
@@ -22,6 +24,7 @@ class DeviceCheckPanel extends StatefulWidget {
     required this.onSettingsChanged,
   });
 
+  final AiGatewayClient gateway;
   final DeviceEventService deviceEvents;
   final SpeechService speech;
   final VisionService vision;
@@ -40,13 +43,18 @@ class _DeviceCheckPanelState extends State<DeviceCheckPanel> {
   DeviceEvent? _lastEvent;
   DeviceSensorSample? _lastSample;
   DeviceSensorSample? _peakSample;
+  String _gatewayStatus = '未测试';
+  String _modelStatus = '未测试';
+  String _sttStatus = '未测试';
   String _speechStatus = '未测试';
   String _visionStatus = '未测试';
   String _ttsStatus = '未测试';
   bool _isListening = false;
   bool _isLooking = false;
   bool _isSpeaking = false;
+  bool _isCheckingGateway = false;
   late CompanionSettings _settings;
+  final Map<String, _AcceptanceStatus> _acceptance = {};
 
   @override
   void initState() {
@@ -94,6 +102,59 @@ class _DeviceCheckPanelState extends State<DeviceCheckPanel> {
       _speechStatus = text?.trim().isNotEmpty == true ? text!.trim() : '无结果';
     });
     widget.logs.info('device_check', 'speech test: $_speechStatus');
+  }
+
+  Future<void> _testGateway() async {
+    if (_isCheckingGateway) {
+      return;
+    }
+    widget.logs.info('device_check', 'gateway diagnostics start');
+    setState(() {
+      _isCheckingGateway = true;
+      _gatewayStatus = '诊断中';
+      _modelStatus = '诊断中';
+      _sttStatus = '诊断中';
+    });
+    final diagnostics = await widget.gateway.diagnostics();
+    if (!mounted) {
+      return;
+    }
+    if (diagnostics == null) {
+      setState(() {
+        _isCheckingGateway = false;
+        _gatewayStatus = '不可达';
+        _modelStatus = '未知';
+        _sttStatus = '未知';
+      });
+      widget.logs.warning('device_check', 'gateway diagnostics failed');
+      return;
+    }
+    final lmstudio = diagnostics['lmstudio'];
+    final stt = diagnostics['stt'];
+    final model = lmstudio is Map ? lmstudio['model'] : null;
+    final enabled = lmstudio is Map ? lmstudio['enabled'] : null;
+    final modelError = lmstudio is Map ? lmstudio['last_error'] : null;
+    final whisperOk = stt is Map ? stt['whisper_model_exists'] == true : false;
+    final cliOk = stt is Map ? stt['whisper_cli_ok'] == true : false;
+    final ffmpegOk = stt is Map ? stt['ffmpeg_ok'] == true : false;
+    final whisperModel = stt is Map ? stt['whisper_model'] : null;
+    setState(() {
+      _isCheckingGateway = false;
+      _gatewayStatus = '已连接';
+      _modelStatus = enabled == true
+          ? '${model ?? 'local-model'}'
+          : 'LM Studio 未启用';
+      if (modelError is String && modelError.isNotEmpty) {
+        _modelStatus = '异常 $modelError';
+      }
+      _sttStatus = whisperOk && cliOk && ffmpegOk
+          ? 'Whisper OK'
+          : 'STT 未就绪';
+    });
+    widget.logs.info(
+      'device_check',
+      'gateway ok model=$_modelStatus stt=$_sttStatus whisper=$whisperModel',
+    );
   }
 
   Future<void> _testVision() async {
@@ -156,6 +217,20 @@ class _DeviceCheckPanelState extends State<DeviceCheckPanel> {
     widget.logs.info('device_check', 'simulate $type');
   }
 
+  void _markAcceptance(String id, _AcceptanceStatus status) {
+    setState(() => _acceptance[id] = status);
+    final item = _AcceptanceItem.items.firstWhere((item) => item.id == id);
+    widget.logs.info(
+      'acceptance',
+      '${item.title}: ${status == _AcceptanceStatus.passed ? 'passed' : 'failed'}',
+    );
+  }
+
+  void _resetAcceptance() {
+    setState(_acceptance.clear);
+    widget.logs.info('acceptance', 'reset');
+  }
+
   DeviceSensorSample _nextPeakSample(DeviceSensorSample sample) {
     final peak = _peakSample;
     if (peak == null ||
@@ -207,6 +282,17 @@ class _DeviceCheckPanelState extends State<DeviceCheckPanel> {
                 label: '峰值',
                 value: _peakSample?.label ?? '等待传感器',
               ),
+              _StatusRow(
+                icon: Icons.cloud_done,
+                label: '网关',
+                value: _gatewayStatus,
+              ),
+              _StatusRow(
+                icon: Icons.psychology,
+                label: '模型',
+                value: _modelStatus,
+              ),
+              _StatusRow(icon: Icons.graphic_eq, label: 'STT', value: _sttStatus),
               _StatusRow(icon: Icons.mic, label: '听', value: _speechStatus),
               _StatusRow(
                 icon: Icons.visibility,
@@ -225,6 +311,14 @@ class _DeviceCheckPanelState extends State<DeviceCheckPanel> {
                 runSpacing: 8,
                 alignment: WrapAlignment.center,
                 children: [
+                  _CheckButton(
+                    key: const ValueKey('checkGateway'),
+                    icon: _isCheckingGateway
+                        ? Icons.sync
+                        : Icons.cloud_done,
+                    label: '网关',
+                    onPressed: _isCheckingGateway ? null : _testGateway,
+                  ),
                   _CheckButton(
                     key: const ValueKey('checkSpeech'),
                     icon: _isListening ? Icons.graphic_eq : Icons.mic,
@@ -302,9 +396,195 @@ class _DeviceCheckPanelState extends State<DeviceCheckPanel> {
                   ),
                 ],
               ),
+              const SizedBox(height: 18),
+              _AcceptanceChecklist(
+                statuses: _acceptance,
+                onMark: _markAcceptance,
+                onReset: _resetAcceptance,
+              ),
             ],
           ),
         ),
+      ),
+    );
+  }
+}
+
+enum _AcceptanceStatus { passed, failed }
+
+class _AcceptanceItem {
+  const _AcceptanceItem({
+    required this.id,
+    required this.title,
+    required this.expected,
+  });
+
+  final String id;
+  final String title;
+  final String expected;
+
+  static const items = [
+    _AcceptanceItem(
+      id: 'gateway',
+      title: 'Gateway 连接',
+      expected: '顶部云图标为已连接，日志出现 health ok。',
+    ),
+    _AcceptanceItem(
+      id: 'speech',
+      title: '语音识别',
+      expected: '点击“听”后说一句中文，识别文本显示在“听”状态行。',
+    ),
+    _AcceptanceItem(
+      id: 'chat_tts',
+      title: '语音回复',
+      expected: '说“你好”，萌萌能回复并播放 TTS，嘴型进入说话状态。',
+    ),
+    _AcceptanceItem(
+      id: 'wake',
+      title: '唤醒词',
+      expected: '开启“萌萌唤醒”，说“萌萌”，进入语音对话状态。',
+    ),
+    _AcceptanceItem(
+      id: 'vision_chat',
+      title: '看图问答',
+      expected: '说“萌萌，你看到了什么”，日志出现 chat/vision。',
+    ),
+    _AcceptanceItem(
+      id: 'vision_monitor',
+      title: '视觉守望',
+      expected: '开启“视觉守望”，有人/无人变化时表情变化但不主动说话。',
+    ),
+    _AcceptanceItem(
+      id: 'interrupt',
+      title: '触摸打断',
+      expected: 'TTS 播放时轻触脸部，语音立即停止。',
+    ),
+    _AcceptanceItem(
+      id: 'impact',
+      title: '强度识别',
+      expected: '轻拍/中拍/重拍/很重显示不同强度，并有不同反应。',
+    ),
+    _AcceptanceItem(
+      id: 'privacy',
+      title: '隐私模式',
+      expected: '开启隐私后，听、看、记忆关闭，视觉守望停止。',
+    ),
+    _AcceptanceItem(
+      id: 'stability',
+      title: '稳定运行',
+      expected: '前台运行 30 分钟，无白屏、无闪退、表情仍然活动。',
+    ),
+  ];
+}
+
+class _AcceptanceChecklist extends StatelessWidget {
+  const _AcceptanceChecklist({
+    required this.statuses,
+    required this.onMark,
+    required this.onReset,
+  });
+
+  final Map<String, _AcceptanceStatus> statuses;
+  final void Function(String id, _AcceptanceStatus status) onMark;
+  final VoidCallback onReset;
+
+  @override
+  Widget build(BuildContext context) {
+    final passed = statuses.values
+        .where((status) => status == _AcceptanceStatus.passed)
+        .length;
+    final failed = statuses.values
+        .where((status) => status == _AcceptanceStatus.failed)
+        .length;
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        Row(
+          children: [
+            Text('MVP 验收', style: Theme.of(context).textTheme.titleSmall),
+            const Spacer(),
+            Text(
+              '$passed/${_AcceptanceItem.items.length} 通过',
+              style: Theme.of(context).textTheme.labelMedium,
+            ),
+            if (failed > 0) ...[
+              const SizedBox(width: 8),
+              Text(
+                '$failed 失败',
+                style: Theme.of(context).textTheme.labelMedium?.copyWith(
+                  color: const Color(0xFFFF6B6B),
+                ),
+              ),
+            ],
+            IconButton(
+              tooltip: '重置验收',
+              visualDensity: VisualDensity.compact,
+              onPressed: onReset,
+              icon: const Icon(Icons.restart_alt),
+            ),
+          ],
+        ),
+        const SizedBox(height: 8),
+        ..._AcceptanceItem.items.map((item) {
+          return _AcceptanceTile(
+            item: item,
+            status: statuses[item.id],
+            onPass: () => onMark(item.id, _AcceptanceStatus.passed),
+            onFail: () => onMark(item.id, _AcceptanceStatus.failed),
+          );
+        }),
+      ],
+    );
+  }
+}
+
+class _AcceptanceTile extends StatelessWidget {
+  const _AcceptanceTile({
+    required this.item,
+    required this.status,
+    required this.onPass,
+    required this.onFail,
+  });
+
+  final _AcceptanceItem item;
+  final _AcceptanceStatus? status;
+  final VoidCallback onPass;
+  final VoidCallback onFail;
+
+  @override
+  Widget build(BuildContext context) {
+    final icon = switch (status) {
+      _AcceptanceStatus.passed => Icons.check_circle,
+      _AcceptanceStatus.failed => Icons.cancel,
+      null => Icons.radio_button_unchecked,
+    };
+    final color = switch (status) {
+      _AcceptanceStatus.passed => const Color(0xFF36D399),
+      _AcceptanceStatus.failed => const Color(0xFFFF6B6B),
+      null => const Color(0xFF9AA7BD),
+    };
+    return ListTile(
+      dense: true,
+      contentPadding: EdgeInsets.zero,
+      leading: Icon(icon, color: color),
+      title: Text(item.title),
+      subtitle: Text(item.expected),
+      trailing: Wrap(
+        spacing: 4,
+        children: [
+          IconButton(
+            tooltip: '通过',
+            visualDensity: VisualDensity.compact,
+            onPressed: onPass,
+            icon: const Icon(Icons.check),
+          ),
+          IconButton(
+            tooltip: '失败',
+            visualDensity: VisualDensity.compact,
+            onPressed: onFail,
+            icon: const Icon(Icons.close),
+          ),
+        ],
       ),
     );
   }

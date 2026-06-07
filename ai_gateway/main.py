@@ -3,6 +3,7 @@ import base64
 import json
 import os
 import re
+import shutil
 import subprocess
 import tempfile
 import time
@@ -13,6 +14,8 @@ from uuid import uuid4
 
 HOST = os.environ.get("AI_GATEWAY_HOST", "0.0.0.0")
 PORT = int(os.environ.get("AI_GATEWAY_PORT", "8787"))
+STARTED_AT = time.time()
+GATEWAY_VERSION = os.environ.get("AI_GATEWAY_VERSION", "dev")
 LMSTUDIO_ENABLED = os.environ.get("LMSTUDIO_ENABLED", "0").lower() in {
     "1",
     "true",
@@ -35,9 +38,12 @@ WHISPER_MODEL = os.environ.get("WHISPER_MODEL", os.path.expanduser("~/Models/whi
 WHISPER_TIMEOUT = float(os.environ.get("WHISPER_TIMEOUT", "45"))
 WHISPER_PROMPT = os.environ.get(
     "WHISPER_PROMPT",
-    "以下是中文语音助手唤醒词：萌萌，小远，群群老师。",
+    "以下是一段中文普通话语音，可能包含对智能助手的称呼，例如“萌萌”“小远”“群群老师”，也可能只是普通对话。请准确转写，不要补全没有听到的内容。",
 )
 FFMPEG_BIN = os.environ.get("FFMPEG_BIN", "ffmpeg")
+MIN_STT_AUDIO_BYTES = int(os.environ.get("MIN_STT_AUDIO_BYTES", "512"))
+MIN_STT_DURATION_MS = int(os.environ.get("MIN_STT_DURATION_MS", "600"))
+HEALTH_CHECK_TIMEOUT = float(os.environ.get("HEALTH_CHECK_TIMEOUT", "1.0"))
 
 VALID_EXPRESSIONS = {
     "neutral",
@@ -362,30 +368,29 @@ def _log_lmstudio_payload(kind, payload):
     if not messages:
         print(f"[gateway] lmstudio {kind} payload messages=[]", flush=True)
         return
-    last = messages[-1]
-    content = last.get("content") if isinstance(last, dict) else None
-    if isinstance(content, str):
-        print(f"[gateway] lmstudio {kind} user.content={content!r}", flush=True)
-        return
-    if isinstance(content, list):
-        text_parts = []
-        image_lengths = []
-        for item in content:
-            if not isinstance(item, dict):
-                continue
-            if item.get("type") == "text":
-                text_parts.append(str(item.get("text", "")))
-            if item.get("type") == "image_url":
-                image_url = item.get("image_url", {})
-                if isinstance(image_url, dict):
-                    image_lengths.append(len(str(image_url.get("url", ""))))
-        print(
-            f"[gateway] lmstudio {kind} user.text={text_parts!r} "
-            f"image_url_len={image_lengths}",
-            flush=True,
-        )
-        return
-    print(f"[gateway] lmstudio {kind} user.content_type={type(content).__name__}", flush=True)
+    for i, msg in enumerate(messages):
+        role = msg.get("role", "?") if isinstance(msg, dict) else "?"
+        content = msg.get("content") if isinstance(msg, dict) else None
+        if isinstance(content, str):
+            preview = content[:120] + "..." if len(content) > 120 else content
+            print(f"[gateway] lmstudio {kind} messages[{i}] role={role} content={preview!r}", flush=True)
+        elif isinstance(content, list):
+            text_parts = []
+            image_count = 0
+            for item in content:
+                if not isinstance(item, dict):
+                    continue
+                if item.get("type") == "text":
+                    text_parts.append(str(item.get("text", "")))
+                if item.get("type") == "image_url":
+                    image_count += 1
+            print(
+                f"[gateway] lmstudio {kind} messages[{i}] role={role} "
+                f"text={text_parts!r} images={image_count}",
+                flush=True,
+            )
+        else:
+            print(f"[gateway] lmstudio {kind} messages[{i}] role={role} content_type={type(content).__name__}", flush=True)
 
 
 class LmStudioClient:
@@ -434,6 +439,9 @@ class LmStudioClient:
         if not self.enabled:
             return None
         prompt = self._prompt(user_content, settings, fallback)
+        if not prompt:
+            print("[gateway] lmstudio chat skipped: empty prompt", flush=True)
+            return None
         persona = user_content.get("persona", "mengmeng") if isinstance(user_content, dict) else "mengmeng"
         print(f"[gateway] lmstudio chat input text={prompt!r}", flush=True)
         payload = {
@@ -753,6 +761,16 @@ def _compact_zh_text(text):
             "請": "请",
             "內": "内",
             "容": "容",
+            "０": "0",
+            "１": "1",
+            "２": "2",
+            "３": "3",
+            "４": "4",
+            "５": "5",
+            "６": "6",
+            "７": "7",
+            "８": "8",
+            "９": "9",
         }
     )
     text = text.translate(translate).lower()
@@ -865,7 +883,13 @@ def consume_recent_stt_text(max_age_seconds=20):
 def transcribe_audio(audio_bytes, audio_format="m4a"):
     audio_format = re.sub(r"[^a-zA-Z0-9]", "", audio_format or "m4a")[:8] or "m4a"
     if not audio_bytes:
-        return {"ok": False, "text": "", "error": "empty_audio"}
+        return _empty_stt_response("empty_audio", ["empty_audio"], "empty_audio")
+    if len(audio_bytes) < MIN_STT_AUDIO_BYTES:
+        return _empty_stt_response(
+            "too_short_audio",
+            ["too_short_audio"],
+            "too_short_audio",
+        )
     if not os.path.exists(WHISPER_MODEL):
         return {"ok": False, "text": "", "error": f"missing_model:{WHISPER_MODEL}"}
     with tempfile.TemporaryDirectory(prefix="mengmeng_stt_") as tmpdir:
@@ -896,8 +920,19 @@ def transcribe_audio(audio_bytes, audio_format="m4a"):
             return {
                 "ok": False,
                 "text": "",
+                "raw_text": "",
+                "normalized_text": "",
+                "cleaned": True,
+                "flags": ["ffmpeg_failed"],
                 "error": f"ffmpeg_failed:{convert.stderr[-240:]}",
             }
+        wav_duration_ms = _pcm16_mono_wav_duration_ms(wav_path)
+        if wav_duration_ms < MIN_STT_DURATION_MS:
+            return _empty_stt_response(
+                "too_short_audio",
+                ["too_short_audio"],
+                "too_short_audio",
+            )
         whisper = subprocess.run(
             [
                 WHISPER_CLI,
@@ -921,28 +956,73 @@ def transcribe_audio(audio_bytes, audio_format="m4a"):
             return {
                 "ok": False,
                 "text": "",
+                "raw_text": "",
+                "normalized_text": "",
+                "cleaned": True,
+                "flags": ["whisper_failed"],
                 "error": f"whisper_failed:{whisper.stderr[-240:]}",
             }
-        text = _clean_whisper_output(whisper.stdout)
+        cleaned = _clean_whisper_output(whisper.stdout)
+        text = cleaned["text"]
         if not text:
             print("[gateway] stt empty, skip wake/chat", flush=True)
             return {
                 "ok": False,
                 "type": "stt_empty",
                 "text": "",
+                "raw_text": cleaned["raw_text"],
+                "normalized_text": "",
+                "cleaned": True,
+                "flags": cleaned["flags"],
                 "reply": "",
                 "should_speak": False,
                 "error": "empty_text",
             }
-        return {"ok": True, "text": text, "error": ""}
+        return {
+            "ok": True,
+            "text": text,
+            "raw_text": cleaned["raw_text"],
+            "normalized_text": _compact_zh_text(text),
+            "cleaned": True,
+            "flags": cleaned["flags"],
+            "error": "",
+        }
+
+
+def _empty_stt_response(error, flags, response_type):
+    return {
+        "ok": False,
+        "type": response_type,
+        "text": "",
+        "raw_text": "",
+        "normalized_text": "",
+        "cleaned": True,
+        "flags": flags,
+        "reply": "",
+        "should_speak": False,
+        "error": error,
+    }
+
+
+def _pcm16_mono_wav_duration_ms(path):
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        return 0
+    # ffmpeg writes 16kHz mono pcm_s16le wav. Subtract the common 44-byte header.
+    payload_bytes = max(0, size - 44)
+    return int(payload_bytes / 32000 * 1000)
 
 
 def _clean_whisper_output(raw):
     lines = []
+    raw_lines = []
+    flags = set()
     for line in (raw or "").splitlines():
         line = re.sub(r"^\s*\[[^\]]+\]\s*", "", line).strip()
         if not line:
             continue
+        raw_lines.append(line)
         if line.startswith("whisper_") or line.startswith("system_info"):
             continue
         compact = re.sub(r"[\s:：()（）【】\[\]<>《》]+", "", line).lower()
@@ -957,9 +1037,100 @@ def _clean_whisper_output(raw):
             "謝謝觀看",
         ]
         if any(marker in compact for marker in hallucination_markers):
+            flags.add("hallucination_template_removed")
+            continue
+        # 过滤 Whisper prompt 文本泄漏（只过滤 prompt 前缀部分，不过滤唤醒词本身）
+        prompt_prefix_markers = [
+            "以下是中文语音助手唤醒词",
+            "以下是的中文语音助手唤醒词",
+            "中文语音助手唤醒词",
+            "语音助手唤醒词",
+        ]
+        line_compact = _compact_zh_text(line)
+        if not line_compact:
+            continue
+        if any(marker in line_compact for marker in prompt_prefix_markers):
+            flags.add("prompt_leak_removed")
+            continue
+        # 过滤 prompt 前缀碎片的泄漏（如 "词：萌，"、"词１萌萌"）
+        prompt_leak_fragments = [
+            "词萌", "词1萌", "词萌萌", "词萌萌萌",
+        ]
+        if any(frag in line_compact for frag in prompt_leak_fragments):
+            flags.add("prompt_leak_removed")
             continue
         lines.append(line)
-    return " ".join(lines).strip()
+    result = " ".join(lines).strip()
+    # 过滤静音幻觉：重复片段视为无效
+    result = _filter_repetition(result)
+    if result and len(_compact_zh_text(result)) <= 2:
+        flags.add("short_text")
+    return {
+        "text": result,
+        "raw_text": " ".join(raw_lines).strip(),
+        "flags": sorted(flags),
+    }
+
+
+def _sequence_similarity(a, b):
+    if not a or not b:
+        return 0.0
+    distance = _levenshtein_distance(a, b)
+    longest = max(len(a), len(b))
+    return 1.0 - distance / longest
+
+
+def _levenshtein_distance(a, b):
+    left = list(a)
+    right = list(b)
+    previous = list(range(len(right) + 1))
+    for i in range(len(left)):
+        diagonal = previous[0]
+        previous[0] = i + 1
+        for j in range(len(right)):
+            insert = previous[j + 1] + 1
+            delete = previous[j] + 1
+            replace = diagonal + (0 if left[i] == right[j] else 1)
+            diagonal = previous[j + 1]
+            previous[j + 1] = min(insert, delete, replace)
+    return previous[len(right)]
+
+
+def _filter_repetition(text):
+    if not text or len(text) < 4:
+        return text
+    segments = re.split(r"[，。！？、,.\s；;！!？?]+", text)
+    segments = [s for s in segments if s]
+    if len(segments) < 2:
+        return text
+    unique = set(segments)
+    # 超过一半片段重复视为幻觉
+    if len(unique) < len(segments) * 0.6:
+        return ""
+    # 所有片段共享一个公共子串（长度>=片段平均长度的60%）也视为幻觉
+    if len(segments) >= 2:
+        avg_len = sum(len(s) for s in segments) / len(segments)
+        common = _longest_common_substring(segments[0], segments[1])
+        for seg in segments[2:]:
+            common = _longest_common_substring(common, seg)
+        if len(common) >= avg_len * 0.6:
+            return ""
+    return text
+
+
+def _longest_common_substring(a, b):
+    if not a or not b:
+        return ""
+    best = ""
+    len_a, len_b = len(a), len(b)
+    for i in range(len_a):
+        for j in range(len_b):
+            k = 0
+            while i + k < len_a and j + k < len_b and a[i + k] == b[j + k]:
+                k += 1
+            if k > len(best):
+                best = a[i:i + k]
+    return best
 
 
 def safe_robot_response(
@@ -1167,6 +1338,34 @@ def response_for_vision(
     return fallback
 
 
+def response_for_chat_vision(
+    text,
+    image_base64,
+    mime_type="image/jpeg",
+    settings=None,
+    use_model=True,
+    persona="mengmeng",
+):
+    user_text = str(text or "").strip()
+    vision_prompt = (
+        f"用户说：{user_text}\n请结合图片用简短自然的中文回答用户。"
+        if user_text
+        else "请用简短自然的中文描述你看到了什么。"
+    )
+    response = response_for_vision(
+        image_base64,
+        prompt=vision_prompt,
+        mime_type=mime_type,
+        settings=settings,
+        use_model=use_model,
+        persona=persona,
+    )
+    response["vision_used"] = bool(str(image_base64 or "").strip()) and response.get("expression") != "confused"
+    response["vision_prompt"] = vision_prompt
+    response["chat_input_text"] = user_text
+    return response
+
+
 def response_for_event(
     event_type,
     settings=None,
@@ -1267,6 +1466,10 @@ def response_for_event(
         "charging": safe_robot_response("补充能量中，感觉好多了。", "charging", "charging", "relaxed", "soft_smile", "soft_pulse", settings=settings),
         "low_battery": safe_robot_response("我电量有点低了，先省点力气。", "low_battery", "low_battery", "droopy", "small_frown", "alert_tick", settings=settings),
         "flip_down": safe_robot_response("我先安静睡一会儿。", "sleepy", "sleeping", "closed", "rest", "none", False, settings=settings),
+        "person_seen": safe_robot_response("我看到你了。", "happy", "listening", "wide_focus", "soft_smile", "soft_tick", False, settings=settings),
+        "person_left": safe_robot_response("我先安静等你。", "sleepy", "sleepy", "slow_blink", "rest", "none", False, settings=settings),
+        "person_near": safe_robot_response("你靠近啦。", "curious", "listening", "wide_focus", "small_open", "soft_tick", False, settings=settings),
+        "person_far": safe_robot_response("你好像离远了一点。", "neutral", "neutral", "focused", "rest", "none", False, settings=settings),
     }
     fallback = mapping.get(
         event_type,
@@ -1291,6 +1494,101 @@ def response_for_event(
     return fallback
 
 
+def gateway_diagnostics():
+    whisper_cli_path = shutil.which(WHISPER_CLI)
+    ffmpeg_path = shutil.which(FFMPEG_BIN)
+    whisper_model_exists = os.path.exists(WHISPER_MODEL)
+    lmstudio = lmstudio_client.health() if lmstudio_client.enabled else lmstudio_client.status()
+    return {
+        "ok": True,
+        "time": datetime.now(timezone.utc).isoformat(),
+        "gateway": {
+            "host": HOST,
+            "port": PORT,
+        },
+        "lmstudio": lmstudio,
+        "stt": {
+            "whisper_cli": WHISPER_CLI,
+            "whisper_cli_path": whisper_cli_path or "",
+            "whisper_cli_ok": bool(whisper_cli_path),
+            "whisper_model": WHISPER_MODEL,
+            "whisper_model_exists": whisper_model_exists,
+            "whisper_timeout": WHISPER_TIMEOUT,
+            "ffmpeg": FFMPEG_BIN,
+            "ffmpeg_path": ffmpeg_path or "",
+            "ffmpeg_ok": bool(ffmpeg_path),
+        },
+        "vision": {
+            "enabled": lmstudio_client.enabled,
+            "model": LMSTUDIO_MODEL,
+            "endpoint": "/chat/vision",
+        },
+        "memory": {
+            "items": len(memory_manager.query()),
+        },
+    }
+
+
+def gateway_health():
+    ffmpeg_path = shutil.which(FFMPEG_BIN)
+    whisper_cli_path = shutil.which(WHISPER_CLI)
+    model_path_exists = os.path.exists(WHISPER_MODEL)
+    stt_reason = None
+    if not ffmpeg_path:
+        stt_reason = "ffmpeg_unavailable"
+    elif not whisper_cli_path:
+        stt_reason = "whisper_cli_unavailable"
+    elif not model_path_exists:
+        stt_reason = f"missing_model:{WHISPER_MODEL}"
+    stt_ok = stt_reason is None
+
+    llm_reachable = True
+    llm_reason = None
+    if lmstudio_client.enabled:
+        try:
+            req = request.Request(f"{lmstudio_client.base_url}/models", method="GET")
+            with request.urlopen(req, timeout=HEALTH_CHECK_TIMEOUT) as response:
+                llm_reachable = 200 <= response.status < 300
+            if not llm_reachable:
+                llm_reason = "llm_unavailable"
+        except Exception as exc:
+            llm_reachable = False
+            llm_reason = exc.__class__.__name__
+    llm_ok = llm_reachable
+
+    tts_ok = True
+    health = {
+        "ok": bool(stt_ok and llm_ok and tts_ok),
+        "gateway": {
+            "ok": True,
+            "version": GATEWAY_VERSION,
+            "uptimeSec": int(time.time() - STARTED_AT),
+        },
+        "stt": {
+            "ok": stt_ok,
+            "engine": "whisper-cli",
+            "ffmpeg": bool(ffmpeg_path),
+            "whisperCli": bool(whisper_cli_path),
+            "modelPathExists": model_path_exists,
+            "reason": stt_reason,
+        },
+        "llm": {
+            "ok": llm_ok,
+            "provider": "lmstudio" if lmstudio_client.enabled else "rules",
+            "model": LMSTUDIO_MODEL if lmstudio_client.enabled else "rules",
+            "reachable": llm_reachable,
+            "reason": llm_reason,
+        },
+        "tts": {
+            "ok": tts_ok,
+            "provider": "system",
+            "reason": None,
+        },
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+    return health
+
+
 class GatewayHandler(BaseHTTPRequestHandler):
     def do_OPTIONS(self):
         self.send_response(204)
@@ -1310,18 +1608,13 @@ class GatewayHandler(BaseHTTPRequestHandler):
             self._json({"ok": True})
             return
         if self.path == "/health":
-            self._json(
-                {
-                    "ok": True,
-                    "service": "pocket_companion_ai_gateway",
-                    "time": datetime.now(timezone.utc).isoformat(),
-                    "model_provider": "lmstudio" if lmstudio_client.enabled else "rules",
-                    "lmstudio": lmstudio_client.status(),
-                }
-            )
+            self._json(gateway_health())
             return
         if self.path == "/model/health":
             self._json(lmstudio_client.health())
+            return
+        if self.path == "/diagnostics":
+            self._json(gateway_diagnostics())
             return
         if self.path == "/debug/last":
             self._json(last_debug)
@@ -1339,7 +1632,9 @@ class GatewayHandler(BaseHTTPRequestHandler):
             if result.get("ok"):
                 remember_stt_text(result.get("text", ""))
             print(
-                f"[gateway] stt ok={result.get('ok')} text={result.get('text')} error={result.get('error')}",
+                f"[gateway] stt bytes={len(audio)} ok={result.get('ok')} "
+                f"flags={result.get('flags', [])} text={result.get('text')} "
+                f"error={result.get('error')}",
                 flush=True,
             )
             self._json(result, status=200 if result.get("ok") else 422)
@@ -1361,6 +1656,13 @@ class GatewayHandler(BaseHTTPRequestHandler):
             recovered = False
             if not chat_text:
                 recovered_text = consume_recent_stt_text()
+                if not recovered_text:
+                    import time as _time
+                    for _attempt in range(3):
+                        _time.sleep(0.3)
+                        recovered_text = consume_recent_stt_text()
+                        if recovered_text:
+                            break
                 if recovered_text:
                     chat_text = recovered_text
                     recovered = True
@@ -1369,6 +1671,40 @@ class GatewayHandler(BaseHTTPRequestHandler):
             response = response_for_text(chat_text, payload.get("settings"), persona=persona)
             response["chat_input_recovered"] = recovered
             record_debug("chat", payload, response)
+            self._json(response)
+            return
+        if self.path == "/chat/vision":
+            chat_text = str(payload.get("text", "")).strip()
+            image_base64 = str(payload.get("image_base64", ""))
+            mime_type = str(payload.get("mime_type", "image/jpeg"))
+            persona = normalize_persona(payload.get("persona", "mengmeng"))
+            print(
+                f"[gateway] chat/vision text={chat_text!r} has_image={bool(image_base64)} "
+                f"base64_len={len(image_base64)} mime_type={mime_type!r}",
+                flush=True,
+            )
+            if not image_base64:
+                # 无图片，退化为普通chat
+                response = response_for_text(chat_text, payload.get("settings"), persona=persona)
+                response["vision_used"] = False
+                response["chat_input_text"] = chat_text
+                record_debug("chat/vision", payload, response)
+                self._json(response)
+                return
+            response = response_for_chat_vision(
+                chat_text,
+                image_base64,
+                mime_type=mime_type,
+                settings=payload.get("settings"),
+                use_model=True,
+                persona=persona,
+            )
+            print(
+                f"[gateway] chat/vision final text={response.get('text', '')!r} "
+                f"vision_used={response.get('vision_used')}",
+                flush=True,
+            )
+            record_debug("chat/vision", payload, response)
             self._json(response)
             return
         if self.path == "/vision":

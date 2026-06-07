@@ -4,6 +4,8 @@ import 'package:flutter/material.dart';
 
 import '../../core/logging/debug_log_store.dart';
 import '../../core/network/ai_gateway_client.dart';
+import '../../core/network/gateway_health.dart';
+import '../../core/network/gateway_health_service.dart';
 import '../chat/robot_response.dart';
 import '../device/device_check_panel.dart';
 import '../device/device_event.dart';
@@ -12,8 +14,23 @@ import '../logs/debug_log_panel.dart';
 import '../memory/memory_panel.dart';
 import '../settings/companion_settings.dart';
 import '../vision/vision_service.dart';
+import '../voice/barge_in_config.dart';
 import '../voice/speech_service.dart';
 import '../voice/tts_service.dart';
+import '../voice/voice_audio_gate_config.dart';
+import '../voice/voice_debug_sample_analyzer.dart';
+import '../voice/voice_debug_sample.dart';
+import '../voice/voice_debug_sample_store.dart';
+import '../voice/voice_debug_sample_summary.dart';
+import '../voice/voice_debug_snapshot.dart';
+import '../voice/voice_events.dart';
+import '../voice/voice_runtime_profile.dart';
+import '../voice/voice_settings_store.dart';
+import '../voice/voice_state.dart';
+import '../voice/voice_tuning_recommendation.dart';
+import '../voice/voice_wake_config.dart';
+import '../voice/widgets/voice_debug_panel.dart';
+import '../voice/voice_wake_controller.dart';
 import 'expression_state.dart';
 import 'face_controller.dart';
 import 'painters/robot_face_painter.dart';
@@ -27,6 +44,8 @@ class FacePage extends StatefulWidget {
     this.vision,
     this.logs,
     this.deviceEvents,
+    this.gatewayHealthService,
+    this.voiceSettingsStore,
   });
 
   final AiGatewayClient? gateway;
@@ -35,46 +54,95 @@ class FacePage extends StatefulWidget {
   final VisionService? vision;
   final DebugLogStore? logs;
   final DeviceEventService? deviceEvents;
+  final GatewayHealthService? gatewayHealthService;
+  final VoiceSettingsStore? voiceSettingsStore;
 
   @override
   State<FacePage> createState() => _FacePageState();
 }
 
 class _FacePageState extends State<FacePage>
-    with SingleTickerProviderStateMixin {
+    with SingleTickerProviderStateMixin, WidgetsBindingObserver {
+  static const Duration _visionSeenInterval = Duration(seconds: 4);
+  static const Duration _visionIdleInterval = Duration(seconds: 10);
+
   late final AnimationController _animation;
   late final FaceController _controller;
   late final AiGatewayClient _gateway;
   late final TtsService _tts;
   late final SpeechService _speech;
   late final VisionService _vision;
+  late final GatewayHealthService _gatewayHealthService;
   late final DebugLogStore _logs;
   late final DeviceEventService _deviceEvents;
   late final TextEditingController _chatTextController;
+  late final VoiceWakeController _voiceWakeController;
+  VoiceDebugSampleStore _voiceDebugSampleStore = MemoryVoiceDebugSampleStore();
+  VoiceSettingsStore _voiceSettingsStore = MemoryVoiceSettingsStore();
   StreamSubscription<DeviceEvent>? _deviceEventSubscription;
+  StreamSubscription<VoiceEvent>? _voiceEventSubscription;
+  StreamSubscription<VoiceDebugSnapshot>? _voiceDebugSubscription;
+  Timer? _gatewayHealthTimer;
   bool _isGatewayOnline = false;
+  GatewayHealth? _gatewayHealth;
   bool _isBusy = false;
   bool _isSpeaking = false;
   bool _isListening = false;
-  bool _isWakeListening = false;
-  bool _isVoiceConversation = false;
+  bool _isVisionMonitoring = false;
+  bool _showVoiceDebugPanel = false;
+  VoiceState _voiceState = VoiceState.idle;
+  VoiceDebugSnapshot _voiceDebugSnapshot = VoiceDebugSnapshot();
+  List<VoiceDebugSample> _recentVoiceDebugSamples = const [];
+  VoiceDebugSampleSummary _voiceDebugSampleSummary =
+      VoiceDebugSampleSummary.empty();
+  VoiceTuningRecommendation _voiceTuningRecommendation =
+      const VoiceDebugSampleAnalyzer().analyze(
+        samples: [],
+        wakeConfig: VoiceWakeConfig(),
+        audioGateConfig: VoiceAudioGateConfig(),
+        bargeInConfig: BargeInConfig(),
+      );
+  String? _voiceDebugSamplePath;
   String _currentPersona = 'mengmeng';
   CompanionSettings _settings = CompanionSettings.initial();
   int _speechToken = 0;
-  int _voiceLoopToken = 0;
-  int _wakeListenToken = 0;
+  int _visionLoopToken = 0;
+  bool? _lastVisualPresence;
 
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     _controller = FaceController();
     _gateway = widget.gateway ?? AiGatewayClient();
     _tts = widget.tts ?? TtsService();
     _speech = widget.speech ?? SpeechService();
     _vision = widget.vision ?? VisionService();
+    _gatewayHealthService =
+        widget.gatewayHealthService ??
+        GatewayHealthService(baseUrl: _gateway.debugBaseUrl);
     _logs = widget.logs ?? DebugLogStore();
     _deviceEvents = widget.deviceEvents ?? DeviceEventService();
     _deviceEventSubscription = _deviceEvents.events.listen(_handleDeviceEvent);
+    _voiceWakeController = VoiceWakeController(
+      speech: _speech,
+      canListen: () =>
+          mounted &&
+          _settings.allowSpeechInput &&
+          !_settings.privacyMode &&
+          !_isBusy &&
+          !_isSpeaking,
+    );
+    _voiceEventSubscription = _voiceWakeController.events.listen(
+      (event) => unawaited(_handleVoiceEvent(event)),
+    );
+    _voiceDebugSubscription = _voiceWakeController.debugSnapshots.listen((
+      snapshot,
+    ) {
+      if (mounted) {
+        setState(() => _voiceDebugSnapshot = _withGatewayHealth(snapshot));
+      }
+    });
     _chatTextController = TextEditingController();
     _animation = AnimationController(
       vsync: this,
@@ -82,17 +150,27 @@ class _FacePageState extends State<FacePage>
     )..repeat();
     _logs.info('gateway', 'base ${_gateway.debugBaseUrl}');
     unawaited(_deviceEvents.start(keepAwake: _settings.keepAwake));
-    _refreshGatewayStatus();
+    unawaited(_initializeVoiceSettings());
+    unawaited(_initializeVoiceDebugSampleStore());
+    _gatewayHealthTimer = Timer(
+      const Duration(milliseconds: 300),
+      () => unawaited(_refreshGatewayStatus()),
+    );
   }
 
   @override
   void dispose() {
-    _wakeListenToken++;
+    WidgetsBinding.instance.removeObserver(this);
+    _gatewayHealthTimer?.cancel();
+    _visionLoopToken++;
+    _voiceWakeController.dispose();
     _animation.dispose();
     _speech.stop();
     _vision.stop();
     _tts.stop();
     unawaited(_deviceEventSubscription?.cancel());
+    unawaited(_voiceEventSubscription?.cancel());
+    unawaited(_voiceDebugSubscription?.cancel());
     if (widget.deviceEvents == null) {
       unawaited(_deviceEvents.dispose());
     }
@@ -101,13 +179,198 @@ class _FacePageState extends State<FacePage>
     super.dispose();
   }
 
-  Future<void> _refreshGatewayStatus() async {
-    final online = await _gateway.health();
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    switch (state) {
+      case AppLifecycleState.resumed:
+        _voiceWakeController.notifyLifecycleResumed();
+        _logs.info('lifecycle', 'resumed');
+      case AppLifecycleState.inactive:
+      case AppLifecycleState.paused:
+      case AppLifecycleState.detached:
+      case AppLifecycleState.hidden:
+        _logs.info('lifecycle', state.name);
+        unawaited(_pauseForAppLifecycle(state));
+    }
+  }
+
+  Future<void> _pauseForAppLifecycle(AppLifecycleState state) async {
+    _speechToken++;
+    _visionLoopToken++;
+    await _voiceWakeController.pauseForLifecycle(state.name);
+    await _tts.stop();
+    _voiceWakeController.notifyTtsEnded();
+    try {
+      await _speech.stop();
+    } catch (_) {}
     if (!mounted) {
       return;
     }
-    setState(() => _isGatewayOnline = online);
-    _logs.info('gateway', online ? 'health ok' : 'health failed');
+    setState(() {
+      _isSpeaking = false;
+      _isListening = false;
+      _isVisionMonitoring = false;
+    });
+  }
+
+  Future<void> _refreshGatewayStatus() async {
+    final health = await _gatewayHealthService.checkHealth();
+    if (!mounted) {
+      return;
+    }
+    _applyGatewayHealth(health);
+    _logs.info(
+      'gateway',
+      health.ok ? 'health ok' : 'health failed ${health.reason}',
+    );
+  }
+
+  void _applyGatewayHealth(GatewayHealth health) {
+    _gatewayHealth = health;
+    final nextSnapshot = _withGatewayHealth(
+      _voiceDebugSnapshot,
+      health: health,
+      runtimeWarning: health.ok ? '' : health.reason,
+    );
+    setState(() {
+      _isGatewayOnline = health.gateway.ok;
+      _voiceDebugSnapshot = nextSnapshot;
+    });
+  }
+
+  VoiceDebugSnapshot _withGatewayHealth(
+    VoiceDebugSnapshot snapshot, {
+    GatewayHealth? health,
+    String? runtimeWarning,
+  }) {
+    final currentHealth = health ?? _gatewayHealth;
+    if (currentHealth == null) {
+      return snapshot;
+    }
+    return snapshot.copyWith(
+      gatewayOk: currentHealth.gateway.ok,
+      sttOk: currentHealth.stt.ok,
+      llmOk: currentHealth.llm.ok,
+      ttsOk: currentHealth.tts.ok,
+      gatewayHealthReason: currentHealth.reason,
+      gatewayCheckedAt: currentHealth.checkedAt,
+      runtimeWarning: runtimeWarning ?? snapshot.runtimeWarning,
+    );
+  }
+
+  Future<bool> _ensureVoiceGatewayReady() async {
+    final health = await _gatewayHealthService.checkHealth();
+    if (!mounted) {
+      return false;
+    }
+    _applyGatewayHealth(health);
+    if (!health.gateway.ok || !health.stt.ok) {
+      final reason = !health.gateway.ok
+          ? 'gateway_unavailable'
+          : 'stt_unavailable';
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('语音服务暂不可用：$reason')));
+      _logs.warning('gateway', 'voice start blocked: $reason');
+      return false;
+    }
+    return true;
+  }
+
+  Future<void> _initializeVoiceSettings() async {
+    try {
+      _voiceSettingsStore =
+          widget.voiceSettingsStore ??
+          await SharedPreferencesVoiceSettingsStore.create();
+      final settings = await _voiceSettingsStore.load();
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        if (settings.activeProfile == VoiceRuntimeProfile.custom) {
+          _voiceWakeController.applyCustomConfig(
+            wakeConfig: settings.wakeConfig,
+            audioGateConfig: settings.audioGateConfig,
+            bargeInConfig: settings.bargeInConfig,
+            source: 'stored',
+          );
+        } else {
+          _voiceWakeController.applyProfile(settings.activeProfile);
+        }
+        _showVoiceDebugPanel = settings.showVoiceDebugPanel;
+      });
+      _logs.info(
+        'speech',
+        'voice profile loaded ${settings.activeProfile.name}',
+      );
+    } catch (error) {
+      _voiceSettingsStore = MemoryVoiceSettingsStore();
+      _voiceWakeController.applyProfile(VoiceRuntimeProfile.balanced);
+      _voiceDebugSnapshot = _voiceDebugSnapshot.copyWith(
+        runtimeWarning: 'voice_settings_load_failed',
+      );
+      _logs.warning('speech', 'voice settings fallback: $error');
+    }
+  }
+
+  Future<void> _persistVoiceSettings() async {
+    final saved = await _voiceSettingsStore.save(
+      VoiceSettingsData(
+        activeProfile: _voiceWakeController.activeProfile,
+        wakeConfig: _voiceWakeController.config,
+        audioGateConfig: _voiceWakeController.audioGateConfig,
+        bargeInConfig: _voiceWakeController.bargeInConfig,
+        showVoiceDebugPanel: _showVoiceDebugPanel,
+      ),
+    );
+    if (!saved) {
+      _logs.warning('speech', 'voice settings save failed');
+      if (mounted) {
+        setState(() {
+          _voiceDebugSnapshot = _voiceDebugSnapshot.copyWith(
+            runtimeWarning: 'voice_settings_save_failed',
+          );
+        });
+      }
+    }
+  }
+
+  Future<void> _initializeVoiceDebugSampleStore() async {
+    try {
+      _voiceDebugSampleStore = await JsonlVoiceDebugSampleStore.create();
+    } catch (error) {
+      _logs.warning('speech', 'voice sample store fallback: $error');
+      _voiceDebugSampleStore = MemoryVoiceDebugSampleStore();
+    }
+    await _refreshVoiceDebugSamples();
+  }
+
+  Future<void> _refreshVoiceDebugSamples() async {
+    try {
+      final samples = await _voiceDebugSampleStore.listRecent();
+      final analysisSamples = await _voiceDebugSampleStore.listRecent(
+        limit: 200,
+      );
+      final summary = await _voiceDebugSampleStore.summarize();
+      final path = await _voiceDebugSampleStore.exportPath();
+      final recommendation = const VoiceDebugSampleAnalyzer().analyze(
+        samples: analysisSamples,
+        wakeConfig: _voiceWakeController.config,
+        audioGateConfig: _voiceWakeController.audioGateConfig,
+        bargeInConfig: _voiceWakeController.bargeInConfig,
+      );
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _recentVoiceDebugSamples = samples;
+        _voiceDebugSampleSummary = summary;
+        _voiceDebugSamplePath = path;
+        _voiceTuningRecommendation = recommendation;
+      });
+    } catch (error) {
+      _logs.warning('speech', 'voice sample refresh failed: $error');
+    }
   }
 
   Future<void> _sendChat() async {
@@ -123,11 +386,7 @@ class _FacePageState extends State<FacePage>
   Future<void> _sendText(String text) async {
     _controller.thinking(label: '正在想');
     await _applyGatewayCall(
-      () => _gateway.chat(
-        text,
-        settings: _settings,
-        persona: _currentPersona,
-      ),
+      () => _gateway.chat(text, settings: _settings, persona: _currentPersona),
     );
   }
 
@@ -135,28 +394,102 @@ class _FacePageState extends State<FacePage>
     if (_isBusy || !_settings.allowVision) {
       return;
     }
-    _controller.thinking(label: '正在看');
-    _logs.info('vision', 'capture start');
-    try {
-      final result = await _vision.checkOnce();
-      if (!result.ok || result.imageBytes == null || result.imageBytes!.isEmpty) {
-        _logs.warning('vision', 'capture failed: ${result.label}');
-        _controller.doubleTap();
+    await _sendTextWithVision(prompt, source: 'manual');
+  }
+
+  void _toggleVisionMonitoring() {
+    if (_isVisionMonitoring) {
+      _visionLoopToken++;
+      setState(() {
+        _isVisionMonitoring = false;
+        _lastVisualPresence = null;
+      });
+      _logs.info('vision', 'monitor stop');
+      return;
+    }
+    if (!_settings.allowVision || _settings.privacyMode) {
+      _logs.warning('vision', 'monitor ignored: vision disabled');
+      return;
+    }
+    setState(() => _isVisionMonitoring = true);
+    _logs.info('vision', 'monitor start');
+    final token = ++_visionLoopToken;
+    unawaited(_runVisionMonitorLoop(token));
+  }
+
+  Future<void> _runVisionMonitorLoop(int token) async {
+    while (mounted && _isVisionMonitoring && token == _visionLoopToken) {
+      if (!_settings.allowVision || _settings.privacyMode) {
+        _toggleVisionMonitoring();
         return;
       }
-      _logs.info('vision', 'captured ${result.imageBytes!.length} bytes');
-      await _applyGatewayCall(
-        () => _gateway.vision(
-          result.imageBytes!,
-          prompt: prompt,
-          settings: _settings,
-          persona: _currentPersona,
-        ),
-      );
-    } catch (error) {
-      _logs.warning('vision', 'look failed: $error');
-      _controller.doubleTap();
+      if (_isBusy || _isListening || _isSpeaking) {
+        await Future<void>.delayed(const Duration(seconds: 2));
+        continue;
+      }
+      final hasPerson = await _checkVisualPresence();
+      if (!mounted || !_isVisionMonitoring || token != _visionLoopToken) {
+        return;
+      }
+      if (hasPerson != null && hasPerson != _lastVisualPresence) {
+        _lastVisualPresence = hasPerson;
+        await _handleVisualPresenceChanged(hasPerson);
+      }
+      final nextDelay = hasPerson == true
+          ? _visionSeenInterval
+          : _visionIdleInterval;
+      await Future<void>.delayed(nextDelay);
     }
+  }
+
+  Future<bool?> _checkVisualPresence() async {
+    _logs.info('vision', 'presence scan');
+    try {
+      final result = await _vision.checkOnce();
+      if (!result.ok ||
+          result.imageBytes == null ||
+          result.imageBytes!.isEmpty) {
+        _logs.warning('vision', 'presence capture failed: ${result.label}');
+        return null;
+      }
+      final response = await _gateway.vision(
+        result.imageBytes!,
+        prompt: '只回答“有人”或“无人”：图片里是否有人、人脸或明显的人体？',
+        settings: _settings,
+        persona: _currentPersona,
+      );
+      final text = response.text.trim();
+      _logs.info('vision', 'presence result: $text');
+      if (text.contains('无人') || text.contains('没有人') || text.contains('沒有人')) {
+        return false;
+      }
+      if (text.contains('有人') || text.contains('人脸') || text.contains('人臉')) {
+        return true;
+      }
+      return null;
+    } catch (error) {
+      _logs.warning('vision', 'presence failed: $error');
+      return null;
+    }
+  }
+
+  Future<void> _handleVisualPresenceChanged(bool hasPerson) async {
+    final eventType = hasPerson ? 'person_seen' : 'person_left';
+    _logs.info('vision', 'presence changed: $eventType');
+    if (hasPerson) {
+      _controller.doubleTap();
+    } else {
+      _controller.longPress();
+    }
+    await _applyGatewayCall(
+      () => _gateway.event(
+        eventType,
+        settings: _settings,
+        persona: _currentPersona,
+        source: 'vision_monitor',
+      ),
+      speakResponse: false,
+    );
   }
 
   Future<void> _listenAndChat() async {
@@ -173,84 +506,28 @@ class _FacePageState extends State<FacePage>
     }
   }
 
-  Future<void> _toggleVoiceConversation() async {
-    final next = !_isVoiceConversation;
-    ++_voiceLoopToken;
-    setState(() => _isVoiceConversation = next);
-    _logs.info('speech', next ? 'voice round start' : 'voice round stop');
-    if (!next) {
-      await _speech.stop();
-      if (mounted) {
-        setState(() => _isListening = false);
-      }
-      return;
-    }
-    try {
-      await _listenAndSendOnce();
-    } catch (error) {
-      _logs.warning('speech', 'voice round failed: $error');
-    } finally {
-      if (mounted) {
-        setState(() {
-          _isListening = false;
-          _isVoiceConversation = false;
-        });
-      }
-    }
-  }
-
+  /// 开启/关闭唤醒监听（齿轮页面控制）
   Future<void> _toggleWakeListening() async {
-    final next = !_isWakeListening;
-    final token = ++_wakeListenToken;
-    setState(() => _isWakeListening = next);
-    _logs.info('speech', next ? 'wake listening start' : 'wake listening stop');
-    if (!next) {
-      await _speech.stop();
-      if (mounted) {
-        setState(() => _isListening = false);
-      }
+    if (_voiceState == VoiceState.monitoring) {
+      await _voiceWakeController.stop();
       return;
     }
-    unawaited(_runWakeListeningLoop(token));
+    if (!await _ensureVoiceGatewayReady()) {
+      return;
+    }
+    await _voiceWakeController.start();
   }
 
-  Future<void> _runWakeListeningLoop(int token) async {
-    while (mounted && _isWakeListening && token == _wakeListenToken) {
-      if (!_settings.allowSpeechInput || _isBusy || _isSpeaking) {
-        await Future<void>.delayed(const Duration(milliseconds: 1200));
-        continue;
-      }
-      setState(() => _isListening = true);
-      String? text;
-      try {
-        text = await _speech.listenOnce(
-          listenFor: const Duration(seconds: 3),
-        );
-      } catch (error) {
-        _logs.warning('speech', 'wake listen failed: $error');
-      }
-      if (!mounted || !_isWakeListening || token != _wakeListenToken) {
-        if (mounted) {
-          setState(() => _isListening = false);
-        }
-        return;
-      }
-      setState(() => _isListening = false);
-      final normalized = text?.trim();
-      if (normalized != null && normalized.isNotEmpty) {
-        _logs.info('speech', 'wake listen heard: $normalized');
-        final wakeCommand = _extractWakeCommand(normalized);
-        if (wakeCommand != null) {
-          await _handleWakeCommand(wakeCommand);
-        } else {
-          _logs.info('speech', 'wake word not matched');
-        }
-      }
-      await Future<void>.delayed(const Duration(milliseconds: 1200));
+  /// 手动触发一次语音对话（麦克风按钮）
+  Future<void> _toggleVoiceConversation() async {
+    if (_voiceState == VoiceState.conversation) {
+      await _voiceWakeController.stop();
+      return;
     }
-    if (mounted && _isListening) {
-      setState(() => _isListening = false);
+    if (!await _ensureVoiceGatewayReady()) {
+      return;
     }
+    await _voiceWakeController.startConversation();
   }
 
   Future<void> _listenAndSendOnce() async {
@@ -273,22 +550,61 @@ class _FacePageState extends State<FacePage>
       return;
     }
     _logs.info('speech', 'recognized: $normalized');
-    final wakeCommand = _extractWakeCommand(normalized);
-    if (wakeCommand != null) {
-      _logs.info('speech', 'wake word detected');
-      await _handleWakeCommand(wakeCommand);
-      return;
-    }
-    final commandText = normalized;
-    await _handleRecognizedCommand(commandText);
+    await _handleRecognizedCommand(normalized);
   }
 
-  Future<void> _handleWakeCommand(_WakeCommand wakeCommand) async {
-    _currentPersona = wakeCommand.persona;
-    _logs.info('speech', 'persona ${wakeCommand.persona}');
-    _controller.setRole(_faceRoleForPersona(wakeCommand.persona));
+  Future<void> _handleVoiceEvent(VoiceEvent event) async {
+    switch (event) {
+      case VoiceStateChanged(:final state):
+        _logs.info('speech', 'state ${_voiceState.name} -> ${state.name}');
+        if (mounted) {
+          setState(() {
+            _voiceState = state;
+            _isListening =
+                state == VoiceState.recording ||
+                state == VoiceState.bargeInListening;
+          });
+        }
+      case WakeDetected():
+        await _handleWakeDetected(event);
+      case UserUtteranceDetected(:final text):
+        await _handleRecognizedCommand(text);
+      case BargeInDetected(:final reason, :final avgRms, :final maxRms):
+        _logs.info(
+          'speech',
+          'barge-in detected reason=$reason avgRms=${avgRms.toStringAsFixed(1)} maxRms=${maxRms.toStringAsFixed(1)}',
+        );
+        await _handleBargeInDetected();
+      case BargeInIgnored(:final reason):
+        _logs.info('speech', 'barge-in ignored reason=$reason');
+      case WakeIgnored(:final reason, :final text):
+        _logs.info('speech', 'wake ignored reason=$reason text=$text');
+      case VoiceLogEvent(:final message):
+        _logs.info('speech', message);
+      case VoiceError(:final error):
+        _logs.warning('speech', 'voice controller error: $error');
+      case WakeOnlyDetected():
+        break;
+    }
+  }
+
+  Future<void> _handleBargeInDetected() async {
+    await _stopSpeaking();
     _controller.doubleTap();
-    if (wakeCommand.command.isEmpty) {
+    if (mounted) {
+      setState(() => _isListening = false);
+    }
+  }
+
+  Future<void> _handleWakeDetected(WakeDetected event) async {
+    _currentPersona = event.persona;
+    _logs.info(
+      'speech',
+      'persona ${event.persona} wake=${event.wakeWord} score=${event.score.toStringAsFixed(2)}',
+    );
+    _controller.setRole(_faceRoleForPersona(event.persona));
+    _controller.doubleTap();
+    if (event.command.isEmpty) {
       await _applyGatewayCall(
         () => _gateway.event(
           'wake',
@@ -299,7 +615,7 @@ class _FacePageState extends State<FacePage>
       );
       return;
     }
-    await _handleRecognizedCommand(wakeCommand.command);
+    await _handleRecognizedCommand(event.command);
   }
 
   Future<void> _handleRecognizedCommand(String commandText) async {
@@ -309,11 +625,57 @@ class _FacePageState extends State<FacePage>
         _controller.doubleTap();
         return;
       }
-      _logs.info('vision', 'voice command: $commandText');
-      await _lookAndAsk(prompt: commandText);
+      _logs.info('vision', 'voice trigger vision: $commandText');
+      await _listenWithVision(commandText);
       return;
     }
     await _sendText(commandText);
+  }
+
+  /// 语音触发视觉：先拍照，然后将文本+图片一起发给LLM
+  Future<void> _listenWithVision(String commandText) async {
+    await _sendTextWithVision(commandText, source: 'voice');
+  }
+
+  Future<void> _sendTextWithVision(
+    String text, {
+    required String source,
+  }) async {
+    _controller.thinking(label: '正在看');
+    _logs.info('vision', 'capture start source=$source text=$text');
+    try {
+      final result = await _vision.checkOnce();
+      if (!result.ok ||
+          result.imageBytes == null ||
+          result.imageBytes!.isEmpty) {
+        _logs.warning('vision', 'capture failed: ${result.label}');
+        if (source == 'voice') {
+          await _sendText(text);
+        } else {
+          _controller.doubleTap();
+        }
+        return;
+      }
+      _logs.info(
+        'vision',
+        'captured ${result.imageBytes!.length} bytes, sending chat+vision',
+      );
+      await _applyGatewayCall(
+        () => _gateway.chatWithVision(
+          text,
+          result.imageBytes!,
+          settings: _settings,
+          persona: _currentPersona,
+        ),
+      );
+    } catch (error) {
+      _logs.warning('vision', 'look failed: $error');
+      if (source == 'voice') {
+        await _sendText(text);
+      } else {
+        _controller.doubleTap();
+      }
+    }
   }
 
   FaceRole _faceRoleForPersona(String persona) {
@@ -324,122 +686,11 @@ class _FacePageState extends State<FacePage>
     };
   }
 
-  _WakeCommand? _extractWakeCommand(String text) {
-    final trimmed = text.trim();
-    final normalized = _normalizeWakeText(trimmed);
-    if (normalized.isEmpty) {
-      return null;
-    }
-    final wakeWords = _wakeWords();
-    for (final wakeWord in wakeWords) {
-      final alias = _normalizeWakeText(wakeWord.text);
-      final index = normalized.indexOf(alias);
-      if (index >= 0) {
-        final command = normalized.replaceFirst(alias, '');
-        return _WakeCommand(persona: wakeWord.persona, command: _cleanWakeCommand(command));
-      }
-    }
-    if (normalized.length <= 8) {
-      _WakeWord? best;
-      var bestScore = 0.0;
-      for (final wakeWord in wakeWords) {
-        final score = _similarity(normalized, _normalizeWakeText(wakeWord.text));
-        if (score > bestScore) {
-          bestScore = score;
-          best = wakeWord;
-        }
-      }
-      if (best != null && bestScore >= 0.62) {
-        return _WakeCommand(persona: best.persona, command: '');
-      }
-    }
-    return null;
-  }
-
-  List<_WakeWord> _wakeWords() {
-    return const [
-      _WakeWord('群群老师', 'qunqun_teacher'),
-      _WakeWord('群群老師', 'qunqun_teacher'),
-      _WakeWord('群俊老师', 'qunqun_teacher'),
-      _WakeWord('秦军老师', 'qunqun_teacher'),
-      _WakeWord('秦群老师', 'qunqun_teacher'),
-      _WakeWord('群君老师', 'qunqun_teacher'),
-      _WakeWord('群軍老師', 'qunqun_teacher'),
-      _WakeWord('群老师', 'qunqun_teacher'),
-      _WakeWord('群老師', 'qunqun_teacher'),
-      _WakeWord('群群', 'qunqun_teacher'),
-      _WakeWord('萌萌', 'mengmeng'),
-      _WakeWord('萌', 'mengmeng'),
-      _WakeWord('梦梦', 'mengmeng'),
-      _WakeWord('夢夢', 'mengmeng'),
-      _WakeWord('蒙蒙', 'mengmeng'),
-      _WakeWord('濛濛', 'mengmeng'),
-      _WakeWord('朦朦', 'mengmeng'),
-      _WakeWord('妹妹', 'mengmeng'),
-      _WakeWord('么么', 'mengmeng'),
-      _WakeWord('萌妹', 'mengmeng'),
-      _WakeWord('农农', 'mengmeng'),
-      _WakeWord('農農', 'mengmeng'),
-      _WakeWord('蜘蛛蜘蛛蜘蛛', 'mengmeng'),
-      _WakeWord('小远同学', 'xiaoyuan'),
-      _WakeWord('小圆同学', 'xiaoyuan'),
-      _WakeWord('小園同学', 'xiaoyuan'),
-      _WakeWord('小远', 'xiaoyuan'),
-      _WakeWord('小遠', 'xiaoyuan'),
-      _WakeWord('小圆', 'xiaoyuan'),
-      _WakeWord('小園', 'xiaoyuan'),
-      _WakeWord('小袁', 'xiaoyuan'),
-      _WakeWord('小源', 'xiaoyuan'),
-      _WakeWord('小元', 'xiaoyuan'),
-      _WakeWord('小语言', 'xiaoyuan'),
-    ];
-  }
-
-  String _normalizeWakeText(String text) {
-    return text
-        .trim()
-        .replaceAll(RegExp(r'[\s，。！？、,.!?~～：:（）()\[\]【】《》"“”‘’]'), '');
-  }
-
-  String _cleanWakeCommand(String text) {
-    final cleaned = _normalizeWakeText(text);
-    const noiseCommands = {'同学', '老師', '老师', '啊', '呀', '呢', '喂'};
-    return noiseCommands.contains(cleaned) ? '' : cleaned;
-  }
-
-  double _similarity(String a, String b) {
-    if (a.isEmpty || b.isEmpty) {
-      return 0;
-    }
-    final distance = _levenshtein(a, b);
-    final longest = a.length > b.length ? a.length : b.length;
-    return 1 - distance / longest;
-  }
-
-  int _levenshtein(String a, String b) {
-    final left = a.runes.toList();
-    final right = b.runes.toList();
-    final previous = List<int>.generate(right.length + 1, (index) => index);
-    for (var i = 0; i < left.length; i++) {
-      var diagonal = previous[0];
-      previous[0] = i + 1;
-      for (var j = 0; j < right.length; j++) {
-        final insert = previous[j + 1] + 1;
-        final delete = previous[j] + 1;
-        final replace = diagonal + (left[i] == right[j] ? 0 : 1);
-        diagonal = previous[j + 1];
-        previous[j + 1] = [insert, delete, replace].reduce(
-          (x, y) => x < y ? x : y,
-        );
-      }
-    }
-    return previous[right.length];
-  }
-
   bool _isVisionCommand(String text) {
-    final compact = text
-        .toLowerCase()
-        .replaceAll(RegExp(r'[\s，。！？、,.!?~～：:]'), '');
+    final compact = text.toLowerCase().replaceAll(
+      RegExp(r'[\s，。！？、,.!?~～：:]'),
+      '',
+    );
     return compact.contains('你看到了什么') ||
         compact.contains('你看見了什麼') ||
         compact.contains('你看见了什么') ||
@@ -506,6 +757,15 @@ class _FacePageState extends State<FacePage>
     _controller.applyRobotResponse(response);
     if (response.isFallback) {
       _logs.warning('fallback', response.fallbackReason);
+      if (response.fallbackReason == 'gateway_timeout' ||
+          response.fallbackReason == 'gateway_unreachable') {
+        _voiceDebugSnapshot = _voiceDebugSnapshot.copyWith(
+          runtimeWarning: response.fallbackReason,
+        );
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Gateway 调用失败：${response.fallbackReason}')),
+        );
+      }
     } else {
       final modelError = response.modelError.isEmpty
           ? ''
@@ -530,6 +790,8 @@ class _FacePageState extends State<FacePage>
     }
     final cue = _ImpactVoiceCue.fromEvent(event);
     final token = ++_speechToken;
+    await _pauseListeningForSpeech();
+    _voiceWakeController.notifyTtsStarted();
     _controller.beginSpeaking();
     _logs.info('tts', 'impact ${cue.level}');
     setState(() => _isSpeaking = true);
@@ -544,6 +806,7 @@ class _FacePageState extends State<FacePage>
       return true;
     }
     _controller.endSpeaking();
+    _voiceWakeController.notifyTtsEnded();
     setState(() => _isSpeaking = false);
     return true;
   }
@@ -554,7 +817,17 @@ class _FacePageState extends State<FacePage>
         response.text.trim().isEmpty) {
       return;
     }
+    final health = _gatewayHealth;
+    if (health != null && !health.tts.ok) {
+      _logs.warning('tts', 'skip: tts_unavailable');
+      _voiceDebugSnapshot = _voiceDebugSnapshot.copyWith(
+        runtimeWarning: 'tts_unavailable',
+      );
+      return;
+    }
     final token = ++_speechToken;
+    await _pauseListeningForSpeech();
+    _voiceWakeController.notifyTtsStarted();
     _controller.beginSpeaking();
     _logs.info('tts', 'start');
     setState(() => _isSpeaking = true);
@@ -570,7 +843,18 @@ class _FacePageState extends State<FacePage>
     }
     _controller.endSpeaking();
     _logs.info('tts', 'end');
+    _voiceWakeController.notifyTtsEnded();
     setState(() => _isSpeaking = false);
+  }
+
+  Future<void> _pauseListeningForSpeech() async {
+    try {
+      await _speech.stop();
+    } catch (_) {}
+    if (!mounted || !_isListening) {
+      return;
+    }
+    setState(() => _isListening = false);
   }
 
   void _updateSettings(CompanionSettings settings) {
@@ -583,25 +867,21 @@ class _FacePageState extends State<FacePage>
     if (!settings.allowSpeechOutput) {
       _stopSpeaking();
     }
-    if (!settings.allowSpeechInput && _isListening) {
-      _voiceLoopToken++;
-      _wakeListenToken++;
-      _speech.stop();
+    if (!settings.allowSpeechInput &&
+        (_voiceState != VoiceState.idle || _isListening)) {
+      _voiceWakeController.stop();
+      setState(() => _isListening = false);
+    }
+    if ((!settings.allowVision || settings.privacyMode) &&
+        _isVisionMonitoring) {
+      _visionLoopToken++;
       setState(() {
-        _isListening = false;
-        _isVoiceConversation = false;
-        _isWakeListening = false;
+        _isVisionMonitoring = false;
+        _lastVisualPresence = null;
       });
+      _logs.info('vision', 'monitor stop: vision disabled');
     }
-    if (!settings.allowSpeechInput && _isVoiceConversation) {
-      _voiceLoopToken++;
-      setState(() => _isVoiceConversation = false);
-    }
-    if (!settings.allowSpeechInput && _isWakeListening) {
-      _wakeListenToken++;
-      setState(() => _isWakeListening = false);
-    }
-    if (!settings.allowVision) {
+    if (!settings.allowVision || settings.privacyMode) {
       unawaited(_vision.stop());
     }
   }
@@ -632,6 +912,7 @@ class _FacePageState extends State<FacePage>
       isScrollControlled: true,
       showDragHandle: true,
       builder: (context) => DeviceCheckPanel(
+        gateway: _gateway,
         deviceEvents: _deviceEvents,
         speech: _speech,
         vision: _vision,
@@ -654,8 +935,9 @@ class _FacePageState extends State<FacePage>
           settings: panelSettings,
           isBusy: _isBusy,
           isListening: _isListening,
-          isVoiceConversation: _isVoiceConversation,
-          isWakeListening: _isWakeListening,
+          isVisionMonitoring: _isVisionMonitoring,
+          showVoiceDebugPanel: _showVoiceDebugPanel,
+          voiceState: _voiceState,
           controller: _controller,
           onSettingsChanged: (next) {
             setPanelState(() => panelSettings = next);
@@ -663,6 +945,15 @@ class _FacePageState extends State<FacePage>
           },
           onListen: _listenAndChat,
           onLook: () => _lookAndAsk(),
+          onToggleVisionMonitoring: _toggleVisionMonitoring,
+          onToggleVoiceDebugPanel: () {
+            setState(() => _showVoiceDebugPanel = !_showVoiceDebugPanel);
+            unawaited(_persistVoiceSettings());
+            if (!_showVoiceDebugPanel) {
+              return;
+            }
+            unawaited(_refreshGatewayStatus());
+          },
           onToggleVoiceConversation: _toggleVoiceConversation,
           onToggleWakeListening: _toggleWakeListening,
           onShowMemory: _showMemoryPanel,
@@ -678,11 +969,59 @@ class _FacePageState extends State<FacePage>
     _speechToken++;
     await _tts.stop();
     _controller.endSpeaking();
+    _voiceWakeController.notifyTtsEnded();
     _logs.info('tts', 'stop');
     if (!mounted) {
       return;
     }
     setState(() => _isSpeaking = false);
+  }
+
+  Future<void> _saveVoiceDebugSample(VoiceDebugSampleLabel label) async {
+    final sample = VoiceDebugSample.fromSnapshot(
+      label: label,
+      snapshot: _voiceDebugSnapshot,
+      voiceWakeConfig: _voiceWakeController.config,
+      audioGateConfig: _voiceWakeController.audioGateConfig,
+    );
+    await _voiceDebugSampleStore.add(sample);
+    await _refreshVoiceDebugSamples();
+    _logs.info(
+      'speech',
+      'voice debug sample saved label=${label.name} total=${_voiceDebugSampleSummary.total}',
+    );
+    if (!mounted) {
+      return;
+    }
+    ScaffoldMessenger.of(
+      context,
+    ).showSnackBar(SnackBar(content: Text('已记录语音样本：${label.name}')));
+  }
+
+  Future<void> _clearVoiceDebugSamples() async {
+    await _voiceDebugSampleStore.clear();
+    await _refreshVoiceDebugSamples();
+    _logs.info('speech', 'voice debug samples cleared');
+    if (!mounted) {
+      return;
+    }
+    ScaffoldMessenger.of(
+      context,
+    ).showSnackBar(const SnackBar(content: Text('已清空语音样本')));
+  }
+
+  void _applyVoiceTuningRecommendation() {
+    setState(() {
+      _voiceWakeController.applyRecommendationAsCustom(
+        _voiceTuningRecommendation,
+      );
+    });
+    unawaited(_persistVoiceSettings());
+    unawaited(_refreshVoiceDebugSamples());
+    _logs.info('speech', 'voice tuning recommendation applied');
+    ScaffoldMessenger.of(
+      context,
+    ).showSnackBar(const SnackBar(content: Text('已应用推荐语音参数')));
   }
 
   @override
@@ -697,11 +1036,13 @@ class _FacePageState extends State<FacePage>
               children: [
                 _StatusBar(
                   state: state,
+                  statusLabel: _activityLabelFor(state),
                   isGatewayOnline: _isGatewayOnline,
                   isBusy: _isBusy,
                   isSpeaking: _isSpeaking,
                   isListening: _isListening,
-                  isWakeListening: _isWakeListening,
+                  isVisionMonitoring: _isVisionMonitoring,
+                  voiceState: _voiceState,
                   onRefresh: _refreshGatewayStatus,
                   onStopSpeaking: _stopSpeaking,
                   onOpenControls: _showControlPanel,
@@ -709,7 +1050,13 @@ class _FacePageState extends State<FacePage>
                 Expanded(
                   child: GestureDetector(
                     behavior: HitTestBehavior.opaque,
-                    onTap: () => _deviceEvents.emitSimulated('tap'),
+                    onTap: () {
+                      if (_isSpeaking) {
+                        unawaited(_stopSpeaking());
+                        return;
+                      }
+                      _deviceEvents.emitSimulated('tap');
+                    },
                     onDoubleTap: () => _deviceEvents.emitSimulated('wake'),
                     onLongPress: () => _deviceEvents.emitSimulated('thinking'),
                     child: Semantics(
@@ -737,6 +1084,51 @@ class _FacePageState extends State<FacePage>
                   onSend: _sendChat,
                   onListen: _listenAndChat,
                 ),
+                if (_showVoiceDebugPanel)
+                  VoiceDebugPanel(
+                    snapshot: _voiceDebugSnapshot,
+                    wakeConfig: _voiceWakeController.config,
+                    audioGateConfig: _voiceWakeController.audioGateConfig,
+                    bargeInConfig: _voiceWakeController.bargeInConfig,
+                    activeProfile: _voiceWakeController.activeProfile,
+                    isCustomProfile: _voiceWakeController.isCustomProfile,
+                    tuningRecommendation: _voiceTuningRecommendation,
+                    onProfileChanged: (profile) {
+                      setState(() {
+                        _voiceWakeController.applyProfile(profile);
+                      });
+                      unawaited(_persistVoiceSettings());
+                      unawaited(_refreshVoiceDebugSamples());
+                    },
+                    onWakeConfigChanged: (config) {
+                      setState(() => _voiceWakeController.updateConfig(config));
+                      unawaited(_persistVoiceSettings());
+                      unawaited(_refreshVoiceDebugSamples());
+                    },
+                    onAudioGateConfigChanged: (config) {
+                      setState(
+                        () =>
+                            _voiceWakeController.updateAudioGateConfig(config),
+                      );
+                      unawaited(_persistVoiceSettings());
+                      unawaited(_refreshVoiceDebugSamples());
+                    },
+                    onBargeInConfigChanged: (config) {
+                      setState(
+                        () => _voiceWakeController.updateBargeInConfig(config),
+                      );
+                      unawaited(_persistVoiceSettings());
+                      unawaited(_refreshVoiceDebugSamples());
+                    },
+                    onApplyTuningRecommendation:
+                        _applyVoiceTuningRecommendation,
+                    onRefreshGatewayHealth: _refreshGatewayStatus,
+                    onSaveSample: _saveVoiceDebugSample,
+                    recentSamples: _recentVoiceDebugSamples,
+                    sampleSummary: _voiceDebugSampleSummary,
+                    sampleExportPath: _voiceDebugSamplePath,
+                    onClearSamples: () => unawaited(_clearVoiceDebugSamples()),
+                  ),
               ],
             ),
           ),
@@ -744,41 +1136,61 @@ class _FacePageState extends State<FacePage>
       },
     );
   }
-}
 
-class _WakeWord {
-  const _WakeWord(this.text, this.persona);
-
-  final String text;
-  final String persona;
-}
-
-class _WakeCommand {
-  const _WakeCommand({required this.persona, required this.command});
-
-  final String persona;
-  final String command;
+  String _activityLabelFor(ExpressionState state) {
+    if (_isSpeaking) {
+      return '正在说话，轻触可打断';
+    }
+    if (_isListening) {
+      return switch (_voiceState) {
+        VoiceState.monitoring => '低功耗监听唤醒词',
+        VoiceState.conversation => '正在听你说',
+        VoiceState.bargeInListening => '正在听打断',
+        _ => '正在识别语音',
+      };
+    }
+    if (_voiceState == VoiceState.bargeInListening) {
+      return '正在听打断';
+    }
+    if (_isBusy) {
+      return state.expression == RobotExpression.focus ? '正在看' : '正在想';
+    }
+    if (_voiceState == VoiceState.conversation) {
+      return '语音对话中';
+    }
+    if (_voiceState == VoiceState.monitoring) {
+      return '低功耗监听中';
+    }
+    if (_isVisionMonitoring) {
+      return '视觉守望中';
+    }
+    return state.label;
+  }
 }
 
 class _StatusBar extends StatelessWidget {
   const _StatusBar({
     required this.state,
+    required this.statusLabel,
     required this.isGatewayOnline,
     required this.isBusy,
     required this.isSpeaking,
     required this.isListening,
-    required this.isWakeListening,
+    required this.isVisionMonitoring,
+    required this.voiceState,
     required this.onRefresh,
     required this.onStopSpeaking,
     required this.onOpenControls,
   });
 
   final ExpressionState state;
+  final String statusLabel;
   final bool isGatewayOnline;
   final bool isBusy;
   final bool isSpeaking;
   final bool isListening;
-  final bool isWakeListening;
+  final bool isVisionMonitoring;
+  final VoiceState voiceState;
   final VoidCallback onRefresh;
   final VoidCallback onStopSpeaking;
   final VoidCallback onOpenControls;
@@ -804,7 +1216,7 @@ class _StatusBar extends StatelessWidget {
           const SizedBox(width: 8),
           Expanded(
             child: Text(
-              state.label,
+              statusLabel,
               key: const ValueKey('expressionLabel'),
               style: textStyle,
               maxLines: 1,
@@ -843,12 +1255,37 @@ class _StatusBar extends StatelessWidget {
               color: const Color(0xFF74D8FF).withValues(alpha: 0.92),
             ),
           ],
-          if (isWakeListening) ...[
+          if (voiceState == VoiceState.monitoring) ...[
             const SizedBox(width: 8),
-            Icon(
-              Icons.radar,
-              size: 18,
-              color: const Color(0xFFB8FF74).withValues(alpha: 0.92),
+            Tooltip(
+              message: '低功耗监听唤醒词',
+              child: Icon(
+                Icons.radar,
+                size: 18,
+                color: const Color(0xFFB8FF74).withValues(alpha: 0.92),
+              ),
+            ),
+          ],
+          if (voiceState == VoiceState.conversation) ...[
+            const SizedBox(width: 8),
+            Tooltip(
+              message: '连续语音对话',
+              child: Icon(
+                Icons.hearing,
+                size: 18,
+                color: const Color(0xFF74D8FF).withValues(alpha: 0.92),
+              ),
+            ),
+          ],
+          if (isVisionMonitoring) ...[
+            const SizedBox(width: 8),
+            Tooltip(
+              message: '低频视觉守望',
+              child: Icon(
+                Icons.center_focus_strong,
+                size: 18,
+                color: const Color(0xFFFFD166).withValues(alpha: 0.92),
+              ),
             ),
           ],
           if (isSpeaking) ...[
@@ -875,7 +1312,7 @@ class _StatusBar extends StatelessWidget {
           Tooltip(
             message: '设置',
             child: IconButton.filledTonal(
-              key: const ValueKey('openControls'),
+              key: const ValueKey('openControlPanel'),
               visualDensity: VisualDensity.compact,
               onPressed: onOpenControls,
               icon: const Icon(Icons.settings, size: 18),
@@ -964,12 +1401,15 @@ class _ControlPanel extends StatelessWidget {
     required this.settings,
     required this.isBusy,
     required this.isListening,
-    required this.isVoiceConversation,
-    required this.isWakeListening,
+    required this.isVisionMonitoring,
+    required this.showVoiceDebugPanel,
+    required this.voiceState,
     required this.controller,
     required this.onSettingsChanged,
     required this.onListen,
     required this.onLook,
+    required this.onToggleVisionMonitoring,
+    required this.onToggleVoiceDebugPanel,
     required this.onToggleVoiceConversation,
     required this.onToggleWakeListening,
     required this.onShowMemory,
@@ -981,12 +1421,15 @@ class _ControlPanel extends StatelessWidget {
   final CompanionSettings settings;
   final bool isBusy;
   final bool isListening;
-  final bool isVoiceConversation;
-  final bool isWakeListening;
+  final bool isVisionMonitoring;
+  final bool showVoiceDebugPanel;
+  final VoiceState voiceState;
   final FaceController controller;
   final ValueChanged<CompanionSettings> onSettingsChanged;
   final VoidCallback onListen;
   final VoidCallback onLook;
+  final VoidCallback onToggleVisionMonitoring;
+  final VoidCallback onToggleVoiceDebugPanel;
   final VoidCallback onToggleVoiceConversation;
   final VoidCallback onToggleWakeListening;
   final VoidCallback onShowMemory;
@@ -996,6 +1439,8 @@ class _ControlPanel extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final isMonitoring = voiceState == VoiceState.monitoring;
+    final isConversation = voiceState == VoiceState.conversation;
     return SafeArea(
       child: SingleChildScrollView(
         padding: const EdgeInsets.fromLTRB(16, 0, 16, 20),
@@ -1010,22 +1455,25 @@ class _ControlPanel extends StatelessWidget {
               runSpacing: 8,
               children: [
                 _PanelAction(
-                  icon: isWakeListening ? Icons.radar : Icons.hearing,
-                  label: isWakeListening ? '关闭唤醒' : '萌萌唤醒',
+                  key: const ValueKey('toggleWakeListening'),
+                  icon: isMonitoring ? Icons.radar : Icons.hearing,
+                  label: isMonitoring ? '关闭唤醒' : '萌萌唤醒',
                   onPressed: isBusy || !settings.allowSpeechInput
                       ? null
                       : onToggleWakeListening,
                 ),
                 _PanelAction(
-                  icon: isVoiceConversation
+                  key: const ValueKey('toggleVoiceConversation'),
+                  icon: isConversation
                       ? Icons.hearing
                       : Icons.record_voice_over,
-                  label: isVoiceConversation ? '关闭对话' : '语音对话',
+                  label: isConversation ? '关闭对话' : '语音对话',
                   onPressed: isBusy || !settings.allowSpeechInput
                       ? null
                       : onToggleVoiceConversation,
                 ),
                 _PanelAction(
+                  key: const ValueKey('panelListenVoice'),
                   icon: isListening ? Icons.graphic_eq : Icons.mic,
                   label: isListening ? '正在听' : '语音输入',
                   onPressed: isBusy || isListening || !settings.allowSpeechInput
@@ -1033,9 +1481,28 @@ class _ControlPanel extends StatelessWidget {
                       : onListen,
                 ),
                 _PanelAction(
+                  key: const ValueKey('panelLook'),
                   icon: Icons.visibility,
                   label: '看一下',
                   onPressed: isBusy || !settings.allowVision ? null : onLook,
+                ),
+                _PanelAction(
+                  key: const ValueKey('toggleVisionMonitoring'),
+                  icon: isVisionMonitoring
+                      ? Icons.visibility_off
+                      : Icons.center_focus_strong,
+                  label: isVisionMonitoring ? '关闭守望' : '视觉守望',
+                  onPressed: isBusy || !settings.allowVision
+                      ? null
+                      : onToggleVisionMonitoring,
+                ),
+                _PanelAction(
+                  key: const ValueKey('toggleVoiceDebugPanel'),
+                  icon: showVoiceDebugPanel
+                      ? Icons.bug_report
+                      : Icons.bug_report_outlined,
+                  label: showVoiceDebugPanel ? '关闭语音调试' : '语音调试',
+                  onPressed: onToggleVoiceDebugPanel,
                 ),
               ],
             ),
@@ -1062,6 +1529,7 @@ class _ControlPanel extends StatelessWidget {
 
 class _PanelAction extends StatelessWidget {
   const _PanelAction({
+    super.key,
     required this.icon,
     required this.label,
     required this.onPressed,
@@ -1290,7 +1758,11 @@ class _DebugDock extends StatelessWidget {
             Tooltip(
               message: action.label,
               child: IconButton.filledTonal(
-                key: ValueKey('debug_${action.label}'),
+                key: ValueKey(
+                  action.eventType == 'shake'
+                      ? 'debugShakeButton'
+                      : 'debug_${action.label}',
+                ),
                 onPressed: isBusy
                     ? null
                     : () {

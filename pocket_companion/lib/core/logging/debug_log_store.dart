@@ -30,10 +30,17 @@ class DebugLogStore extends ChangeNotifier {
         createdAt: DateTime.now(),
       ),
     );
-    if (_entries.length > 120) {
-      _entries.removeRange(0, _entries.length - 120);
+    if (_entries.length > 300) {
+      _entries.removeRange(0, _entries.length - 300);
     }
     notifyListeners();
+  }
+
+  String exportText() {
+    return _entries.map((entry) {
+      final time = entry.createdAt.toIso8601String();
+      return '[$time] ${entry.level.name} ${entry.category}: ${entry.message}';
+    }).join('\n');
   }
 
   void clear() {

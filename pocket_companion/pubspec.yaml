@@ -33,7 +33,9 @@ dependencies:
   flutter:
     sdk: flutter
   flutter_tts: ^4.2.5
+  path_provider: ^2.1.5
   sensors_plus: ^7.0.0
+  shared_preferences: ^2.5.5
   speech_to_text: ^7.3.0
   wakelock_plus: ^1.4.0
 

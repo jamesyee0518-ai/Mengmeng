@@ -1,6 +1,7 @@
 import 'dart:async';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/foundation.dart';
 
 import '../../core/logging/debug_log_store.dart';
 import '../../core/network/ai_gateway_client.dart';
@@ -29,6 +30,7 @@ import '../voice/voice_settings_store.dart';
 import '../voice/voice_state.dart';
 import '../voice/voice_tuning_recommendation.dart';
 import '../voice/voice_wake_config.dart';
+import '../voice/wake_detector_type.dart';
 import '../voice/widgets/voice_debug_panel.dart';
 import '../voice/voice_wake_controller.dart';
 import 'expression_state.dart';
@@ -126,6 +128,11 @@ class _FacePageState extends State<FacePage>
     _deviceEventSubscription = _deviceEvents.events.listen(_handleDeviceEvent);
     _voiceWakeController = VoiceWakeController(
       speech: _speech,
+      config: VoiceWakeConfig(
+        wakeDetectorType: defaultTargetPlatform == TargetPlatform.android
+            ? WakeDetectorType.sherpaOnnx
+            : WakeDetectorType.stt,
+      ),
       canListen: () =>
           mounted &&
           _settings.allowSpeechInput &&

@@ -20,20 +20,21 @@ Completed:
 - V1.7.5: Gateway `/health`, timeout protection, and offline degradation.
 - V1.8: runtime voice profiles and persistent settings.
 - V2.0-alpha: `WakeDetector` abstraction, default `SttWakeDetector`, and native detector stubs for Sherpa-ONNX and openWakeWord.
+- V2.1-alpha: Sherpa-ONNX 1.13.4 Android KWS integration, bundled Mengmeng model, 16 kHz native PCM stream, and automatic STT fallback.
 
-Current default monitoring path:
+Current Android monitoring path:
 
 ```text
 VoiceWakeController
-  -> WakeDetector.detectOnce()
-  -> SttWakeDetector
-  -> SpeechService.listenOnce()
-  -> audio gate
-  -> Gateway /stt
-  -> WakeWordMatcher
+  -> SherpaOnnxWakeDetector
+  -> Android EventChannel (16 kHz mono PCM)
+  -> local sherpa-onnx keyword spotter
+  -> Mengmeng / Xiaoyuan / Qunqun teacher
   -> WakeDetectorDetected / WakeDetectorIgnored
   -> VoiceWakeController converts to VoiceEvent
 ```
+
+If native initialization or model loading fails, monitoring falls back to the existing STT wake path. Conversation recording and conversation STT are unchanged.
 
 Compatibility retained:
 
@@ -51,29 +52,14 @@ Latest verification:
 
 ## Next Development Plan
 
-Goal: connect Sherpa-ONNX to monitoring wake-up only. Do not change conversation STT.
+Goal: complete real-device tuning of Sherpa-ONNX monitoring wake-up. Do not change conversation STT.
 
-1. Implement Dart `SherpaOnnxWakeDetector` and fake native-event unit tests.
-   - Add a Dart detector implementation that consumes native wake events.
-   - Keep `SttWakeDetector` as fallback.
-   - Test detector event mapping with fake native events first.
-
-2. Add Android MethodChannel/EventChannel.
-   - Use MethodChannel for init, start, stop, dispose, and status.
-   - Use EventChannel for streaming wake events and errors.
-   - Preserve recording mutex rules so Sherpa monitoring does not conflict with `recordUntilSilence` or barge-in.
-
-3. Add model file path and initialization.
-   - Define Android model asset or external file path handling.
-   - Report model path, init status, and errors into `VoiceDebugSnapshot`.
-   - Fail safely back to STT if model initialization fails.
-
-4. Run real-device experiments.
+1. Run real-device experiments.
    - Test quiet room, noisy room, far-field, TTS playback, and lifecycle transitions.
    - Verify that monitoring local wake does not call Gateway `/stt` unless fallback is explicitly used.
    - Verify conversation still records with `recordUntilSilence` and sends user utterances to STT.
 
-5. Add Debug Panel switching and JSONL fields.
+2. Add Debug Panel switching and JSONL fields.
    - Allow selecting STT / Sherpa-ONNX / openWakeWord from the debug panel.
    - Persist selected detector type with voice settings.
    - Record detector type, native score, model status, and fallback reason in JSONL samples.

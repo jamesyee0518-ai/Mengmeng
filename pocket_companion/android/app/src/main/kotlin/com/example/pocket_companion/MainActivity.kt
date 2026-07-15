@@ -14,10 +14,14 @@ import java.util.concurrent.atomic.AtomicBoolean
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
+import io.flutter.plugin.common.EventChannel
 
 class MainActivity : FlutterActivity() {
     private val recordingInProgress = AtomicBoolean(false)
     private var activeRecordingCancel: (() -> Unit)? = null
+    private val sherpaAudioRunning = AtomicBoolean(false)
+    private var sherpaAudioThread: Thread? = null
+    private var sherpaAudioSink: EventChannel.EventSink? = null
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
@@ -51,6 +55,80 @@ class MainActivity : FlutterActivity() {
                 else -> result.notImplemented()
             }
         }
+        MethodChannel(
+            flutterEngine.dartExecutor.binaryMessenger,
+            "pocket_companion/sherpa_wake_control"
+        ).setMethodCallHandler { call, result ->
+            when (call.method) {
+                "start" -> result.success(startSherpaAudio())
+                "stop" -> { stopSherpaAudio(); result.success(null) }
+                "status" -> result.success(mapOf("running" to sherpaAudioRunning.get()))
+                else -> result.notImplemented()
+            }
+        }
+        EventChannel(
+            flutterEngine.dartExecutor.binaryMessenger,
+            "pocket_companion/sherpa_wake_audio"
+        ).setStreamHandler(object : EventChannel.StreamHandler {
+            override fun onListen(arguments: Any?, events: EventChannel.EventSink?) {
+                sherpaAudioSink = events
+            }
+            override fun onCancel(arguments: Any?) {
+                sherpaAudioSink = null
+                stopSherpaAudio()
+            }
+        })
+    }
+
+    private fun startSherpaAudio(): Map<String, Any> {
+        if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+            throw SecurityException("Microphone permission is not granted")
+        }
+        if (recordingInProgress.get()) return mapOf("started" to false, "reason" to "recording_busy")
+        if (!sherpaAudioRunning.compareAndSet(false, true)) return mapOf("started" to true)
+        sherpaAudioThread = Thread {
+            val sampleRate = 16000
+            val minSize = AudioRecord.getMinBufferSize(
+                sampleRate, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT
+            )
+            val audioRecord = AudioRecord(
+                MediaRecorder.AudioSource.VOICE_RECOGNITION,
+                sampleRate,
+                AudioFormat.CHANNEL_IN_MONO,
+                AudioFormat.ENCODING_PCM_16BIT,
+                maxOf(minSize, 3200)
+            )
+            val samples = ShortArray(1600)
+            try {
+                audioRecord.startRecording()
+                while (sherpaAudioRunning.get() && !recordingInProgress.get()) {
+                    val count = audioRecord.read(samples, 0, samples.size)
+                    if (count > 0) {
+                        val bytes = ByteArray(count * 2)
+                        for (i in 0 until count) {
+                            bytes[i * 2] = (samples[i].toInt() and 0xff).toByte()
+                            bytes[i * 2 + 1] = ((samples[i].toInt() shr 8) and 0xff).toByte()
+                        }
+                        Handler(Looper.getMainLooper()).post { sherpaAudioSink?.success(bytes) }
+                    }
+                }
+            } catch (error: Exception) {
+                Handler(Looper.getMainLooper()).post {
+                    sherpaAudioSink?.error("sherpa_audio_failed", error.message, null)
+                }
+            } finally {
+                try { audioRecord.stop() } catch (_: Exception) {}
+                audioRecord.release()
+                sherpaAudioRunning.set(false)
+            }
+        }.also { it.start() }
+        return mapOf("started" to true, "sampleRate" to 16000)
+    }
+
+    private fun stopSherpaAudio() {
+        sherpaAudioRunning.set(false)
+        try { sherpaAudioThread?.join(300) } catch (_: Exception) {}
+        sherpaAudioThread = null
     }
 
     private fun speechRecognitionStatus(): Map<String, Any> {

@@ -3,6 +3,7 @@ import 'dart:async';
 import 'barge_in_config.dart';
 import 'barge_in_result.dart';
 import 'native_wake_detector_stub.dart';
+import 'sherpa_onnx_wake_detector.dart';
 import 'speech_service.dart';
 import 'stt_wake_detector.dart';
 import 'voice_audio_gate_config.dart';
@@ -653,7 +654,14 @@ WakeDetector _createWakeDetector({
       wakeConfigProvider: wakeConfigProvider,
       audioGateConfigProvider: audioGateConfigProvider,
     ),
-    WakeDetectorType.sherpaOnnx ||
+    WakeDetectorType.sherpaOnnx => SherpaOnnxWakeDetector(
+      fallback: SttWakeDetector(
+        speechService: speech,
+        wakeWordMatcher: matcher,
+        wakeConfigProvider: wakeConfigProvider,
+        audioGateConfigProvider: audioGateConfigProvider,
+      ),
+    ),
     WakeDetectorType.openWakeWord => NativeWakeDetectorStub(type),
   };
 }

@@ -146,3 +146,13 @@ Device: HUAWEI P30 Pro (VOG-AL10), Android 10 / EMUI —— 老权限模型（BL
 - 结合 15:12 的 `DJIHandheldHelper: set led failedTIMEOUT`：BLE 链路通、指令送达、**OM3 本体不执行**（一直如此）。
 - 判定：①OM3 待机休眠（电机锁定，需短按电源键/半按快门唤醒，唤醒后 1-2 分钟内有效）；②若仍超时 → OM3 未激活，需 DJI Mimo App 首次激活 + 固件检查。
 - EMUI 新坑：自定义 tag 日志（连 Log.e）会被 logd 拉黑（tag 级限流/黑名单），诊断要趁早读或走应用内日志面板。
+
+
+## 2026-09-28 代码链路复查：NV21 帧丢弃与转动时长修复
+
+- 当前锁定依赖 `camera_android_camerax 0.6.30` 将 NV21 输出整理为**单平面**紧密缓冲；原 `_toInputImage` 要求至少两个平面，导致正常相机帧直接丢弃，不能据“云台跟随中”状态推断检测已运行。
+- 修复：直接传入单平面 NV21 缓冲，校验格式、平面数、尺寸、行跨度及缓冲长度；拒绝将原始多平面 YUV420 拼接后冒充 NV21。新增 3 项回归测试。
+- DJI 本地官方 API 文档说明 `Rotation.Builder.time(double)` 的单位是秒；`rotateTo` 的 `durationMs / 100` 已改为 `/ 1000.0`，800ms 正确对应 0.8s。此修复针对角度控制，不是对 SPEED 指令超时原因的判断。
+- 验证：Flutter 全量测试 110 项通过；Android debug APK 构建成功。
+- 本轮 ADB 未检测到手机，尚未安装或做物理跟踪、方向标定、姿态反馈及超时复测。历史“休眠/未激活”等判断不能替代本轮实测证据。
+- 现场顺序：连接并授权 USB 调试 → 保留数据覆盖安装 → 启动跟随 → 确认 `face detected` 及非零偏差 → 对照 `cmd`、DJI rotate 回调和姿态变化 → 最后测试停止、左右/上下方向及丢失目标行为。

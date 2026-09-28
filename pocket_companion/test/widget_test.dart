@@ -15,11 +15,23 @@ import 'package:pocket_companion/features/vision/vision_service.dart';
 import 'package:pocket_companion/features/voice/speech_service.dart';
 import 'package:pocket_companion/features/voice/tts_service.dart';
 
+
+/// 沉浸式模式：触摸脸区唤出顶部状态条与底部输入区
+Future<void> _revealComposer(WidgetTester tester) async {
+  await tester.tap(find.byKey(const ValueKey('robotFaceArea')));
+  // 推进时间冲掉双击识别器的等待定时器，避免测试收尾报 pending timer
+  await tester.pump(const Duration(milliseconds: 400));
+}
+
 void main() {
   testWidgets('FacePage smoke builds robot shell', (tester) async {
     await tester.pumpWidget(_testApp());
 
     expect(find.bySemanticsLabel('robot face neutral'), findsOneWidget);
+    // 顶部状态条与底部输入区默认都隐藏，触摸脸区后一起出现
+    expect(find.byKey(const ValueKey('openControlPanel')), findsNothing);
+    expect(find.byKey(const ValueKey('chatInput')), findsNothing);
+    await _revealComposer(tester);
     expect(find.byKey(const ValueKey('openControlPanel')), findsOneWidget);
     expect(find.byKey(const ValueKey('chatInput')), findsOneWidget);
     expect(find.byKey(const ValueKey('listenVoice')), findsOneWidget);
@@ -54,6 +66,7 @@ void main() {
 
   testWidgets('chat can start and stop speaking', (tester) async {
     await tester.pumpWidget(_testApp());
+    await _revealComposer(tester);
 
     await tester.enterText(find.byKey(const ValueKey('chatInput')), 'hello');
     await tester.tap(find.byKey(const ValueKey('sendChat')));
@@ -70,6 +83,7 @@ void main() {
 
   testWidgets('privacy disables composer voice input', (tester) async {
     await tester.pumpWidget(_testApp());
+    await _revealComposer(tester);
     await _openControls(tester);
 
     await tester.tap(find.byKey(const ValueKey('togglePrivacy')));
@@ -145,6 +159,7 @@ void main() {
 }
 
 Future<void> _openControls(WidgetTester tester) async {
+  await _revealComposer(tester);
   await tester.tap(find.byKey(const ValueKey('openControlPanel')));
   await tester.pump();
   await tester.pump(const Duration(milliseconds: 300));
@@ -232,6 +247,7 @@ class _FakeTtsService extends TtsService {
     double speed = 0.95,
     double pitch = 1.0,
     double volume = 0.75,
+    String persona = 'mengmeng',
   }) {
     spokenTexts.add(text);
     if (style == 'impact') {

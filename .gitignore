@@ -35,3 +35,5 @@ venv/
 .env
 .env.*
 !.env.example
+scripts/local.env
+Models/

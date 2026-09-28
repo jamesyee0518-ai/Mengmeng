@@ -4,12 +4,30 @@
     <uses-permission android:name="android.permission.RECORD_AUDIO"/>
     <uses-permission android:name="android.permission.WAKE_LOCK"/>
     <uses-permission android:name="android.permission.VIBRATE"/>
+    <!-- DJI Osmo Mobile 3 蓝牙连接（V4 SDK 兼容 Android 12 前后权限模型） -->
+    <uses-permission android:name="android.permission.BLUETOOTH" android:maxSdkVersion="30"/>
+    <uses-permission android:name="android.permission.BLUETOOTH_ADMIN" android:maxSdkVersion="30"/>
+    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" android:maxSdkVersion="30"/>
+    <uses-permission android:name="android.permission.BLUETOOTH_SCAN"
+        android:usesPermissionFlags="neverForLocation"/>
+    <uses-permission android:name="android.permission.BLUETOOTH_CONNECT"/>
+    <uses-feature android:name="android.hardware.bluetooth" android:required="false"/>
+    <uses-feature android:name="android.hardware.bluetooth_le" android:required="false"/>
+    <uses-feature android:name="android.hardware.camera" android:required="false"/>
 
     <application
+        android:name=".CompanionApplication"
         android:label="pocket_companion"
-        android:name="${applicationName}"
         android:icon="@mipmap/ic_launcher"
         android:usesCleartextTraffic="true">
+        <!-- DJI Mobile SDK V4 App Key（绑定包名 com.example.pocket_companion） -->
+        <meta-data
+            android:name="com.dji.sdk.API_KEY"
+            android:value="5d5e395ea28af58036eca181"/>
+        <!-- DJI SDK 依赖被 Android 28 移除的 Apache HTTP 客户端 -->
+        <uses-library
+            android:name="org.apache.http.legacy"
+            android:required="false"/>
         <activity
             android:name=".MainActivity"
             android:exported="true"

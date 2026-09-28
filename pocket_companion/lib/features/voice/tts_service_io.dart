@@ -1,11 +1,25 @@
 import 'dart:async';
+import 'dart:convert';
+import 'dart:io';
+import 'dart:typed_data';
 
+import 'package:audioplayers/audioplayers.dart';
 import 'package:flutter_tts/flutter_tts.dart';
 
+/// TTS：网络合成优先（网关 /tts -> 语音服务器 edge-tts，音色远好于系统 TTS），
+/// 网络不可用时自动回退手机系统合成（flutter_tts）。
 class TtsService {
-  TtsService({FlutterTts? tts}) : _tts = tts ?? FlutterTts();
+  TtsService({FlutterTts? tts, String? networkBaseUrl})
+    : _tts = tts ?? FlutterTts(),
+      _networkBaseUrl = networkBaseUrl;
 
   final FlutterTts _tts;
+  final String? _networkBaseUrl;
+  final HttpClient _httpClient = HttpClient()
+    ..connectionTimeout = const Duration(seconds: 8);
+
+  AudioPlayer? _netPlayer;
+  StreamSubscription<void>? _netCompleteSub;
   Completer<void>? _activeCompleter;
 
   Future<void> speak(
@@ -14,12 +28,107 @@ class TtsService {
     double speed = 0.95,
     double pitch = 1.0,
     double volume = 0.75,
+    String persona = 'mengmeng',
   }) async {
     await stop();
     if (text.trim().isEmpty) {
       return;
     }
+    if (_networkBaseUrl != null) {
+      final spoken = await _speakViaNetwork(
+        text,
+        style: style,
+        speed: speed,
+        persona: persona,
+      );
+      if (spoken) {
+        return;
+      }
+    }
+    await _speakViaSystem(
+      text,
+      style: style,
+      speed: speed,
+      pitch: pitch,
+      volume: volume,
+    );
+  }
 
+  // ------------------------------------------------------------ 网络合成
+
+  Future<bool> _speakViaNetwork(
+    String text, {
+    required String style,
+    required double speed,
+    required String persona,
+  }) async {
+    try {
+      final uri = Uri.parse('$_networkBaseUrl/tts');
+      final request = await _httpClient
+          .postUrl(uri)
+          .timeout(const Duration(seconds: 8));
+      request.headers.contentType = ContentType.json;
+      request.write(
+        jsonEncode({
+          'text': text,
+          'style': style,
+          'persona': persona,
+          'speed': speed,
+        }),
+      );
+      final response = await request
+          .close()
+          .timeout(const Duration(seconds: 25));
+      if (response.statusCode != 200) {
+        return false;
+      }
+      final builder = BytesBuilder(copy: false);
+      await for (final chunk in response) {
+        builder.add(chunk);
+      }
+      final bytes = Uint8List.fromList(builder.takeBytes());
+      if (bytes.isEmpty) {
+        return false;
+      }
+      return _playNetworkAudio(bytes);
+    } catch (_) {
+      return false;
+    }
+  }
+
+  Future<bool> _playNetworkAudio(Uint8List bytes) async {
+    final player = _netPlayer ??= AudioPlayer();
+    final completer = Completer<void>();
+    _activeCompleter = completer;
+    await _netCompleteSub?.cancel();
+    _netCompleteSub = player.onPlayerComplete.listen((_) {
+      if (!completer.isCompleted) {
+        completer.complete();
+      }
+    });
+    try {
+      await player.play(BytesSource(bytes));
+    } catch (_) {
+      return false;
+    }
+    // mp3 24kbps 估算：字节*8/24 毫秒，留 3 秒余量，上限 90 秒
+    final estimatedMs = 3000 + (bytes.lengthInBytes * 8 / 24).round();
+    await completer.future.timeout(
+      Duration(milliseconds: estimatedMs.clamp(3000, 90000)),
+      onTimeout: () {},
+    );
+    return true;
+  }
+
+  // ------------------------------------------------------------ 系统合成
+
+  Future<void> _speakViaSystem(
+    String text, {
+    required String style,
+    required double speed,
+    required double pitch,
+    required double volume,
+  }) async {
     final completer = Completer<void>();
     _activeCompleter = completer;
     _tts.setCompletionHandler(() {
@@ -93,6 +202,9 @@ class TtsService {
   }
 
   Future<void> stop() async {
+    try {
+      await _netPlayer?.stop();
+    } catch (_) {}
     try {
       await _tts.stop();
     } catch (_) {}

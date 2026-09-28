@@ -12,9 +12,10 @@ class AiGatewayClient {
   static const Duration visionTimeout = Duration(seconds: 120);
 
   AiGatewayClient({
+    // 通过 frp 域名 + webui 蓝图反代访问 Mac 网关，不依赖内网 IP
     this.baseUrl = const String.fromEnvironment(
       'AI_GATEWAY_BASE_URL',
-      defaultValue: 'http://192.168.1.111:8787',
+      defaultValue: 'https://aipipeline.hiqer.top/mengmeng/gw',
     ),
     RobotHttpTransport? transport,
   }) : _transport = transport ?? RobotHttpTransport();

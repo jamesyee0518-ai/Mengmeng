@@ -11,9 +11,15 @@ import '../chat/robot_response.dart';
 import '../device/device_check_panel.dart';
 import '../device/device_event.dart';
 import '../device/device_event_service.dart';
+import '../gimbal/follow_controller.dart';
+import '../gimbal/gimbal_models.dart';
+import '../gimbal/gimbal_service.dart';
 import '../logs/debug_log_panel.dart';
 import '../memory/memory_panel.dart';
 import '../settings/companion_settings.dart';
+import '../vision/face_observation.dart';
+import '../vision/face_stream_service.dart';
+import '../vision/presence_tracker.dart';
 import '../vision/vision_service.dart';
 import '../voice/barge_in_config.dart';
 import '../voice/speech_service.dart';
@@ -44,6 +50,8 @@ class FacePage extends StatefulWidget {
     this.tts,
     this.speech,
     this.vision,
+    this.gimbal,
+    this.faceStream,
     this.logs,
     this.deviceEvents,
     this.gatewayHealthService,
@@ -54,6 +62,8 @@ class FacePage extends StatefulWidget {
   final TtsService? tts;
   final SpeechService? speech;
   final VisionService? vision;
+  final GimbalService? gimbal;
+  final FaceStreamService? faceStream;
   final DebugLogStore? logs;
   final DeviceEventService? deviceEvents;
   final GatewayHealthService? gatewayHealthService;
@@ -74,6 +84,8 @@ class _FacePageState extends State<FacePage>
   late final TtsService _tts;
   late final SpeechService _speech;
   late final VisionService _vision;
+  late final GimbalService _gimbal;
+  late final FaceStreamService _faceStream;
   late final GatewayHealthService _gatewayHealthService;
   late final DebugLogStore _logs;
   late final DeviceEventService _deviceEvents;
@@ -84,7 +96,12 @@ class _FacePageState extends State<FacePage>
   StreamSubscription<DeviceEvent>? _deviceEventSubscription;
   StreamSubscription<VoiceEvent>? _voiceEventSubscription;
   StreamSubscription<VoiceDebugSnapshot>? _voiceDebugSubscription;
+  StreamSubscription<FaceObservation>? _faceStreamSubscription;
+  StreamSubscription<GimbalDeviceState>? _gimbalStateSubscription;
+  StreamSubscription<String>? _gimbalErrorSubscription;
   Timer? _gatewayHealthTimer;
+  Timer? _overlayHideTimer;
+  bool _overlayVisible = false;
   bool _isGatewayOnline = false;
   GatewayHealth? _gatewayHealth;
   bool _isBusy = false;
@@ -92,6 +109,18 @@ class _FacePageState extends State<FacePage>
   bool _isListening = false;
   bool _isVisionMonitoring = false;
   bool _showVoiceDebugPanel = false;
+  bool _isFollowActive = false;
+  bool _isGimbalControllable = false;
+  String _gimbalModel = '';
+  GimbalPhase _gimbalPhase = GimbalPhase.idle;
+  FollowCommand _lastFollowCommand = const FollowCommand(
+    phase: FollowPhase.idle,
+    yawDps: 0,
+    pitchDps: 0,
+  );
+  DateTime? _lastVelocitySentAt;
+  final PresenceTracker _presenceTracker = PresenceTracker();
+  final FollowController _followController = FollowController();
   VoiceState _voiceState = VoiceState.idle;
   VoiceDebugSnapshot _voiceDebugSnapshot = VoiceDebugSnapshot();
   List<VoiceDebugSample> _recentVoiceDebugSamples = const [];
@@ -117,9 +146,30 @@ class _FacePageState extends State<FacePage>
     WidgetsBinding.instance.addObserver(this);
     _controller = FaceController();
     _gateway = widget.gateway ?? AiGatewayClient();
-    _tts = widget.tts ?? TtsService();
+    _tts = widget.tts ?? TtsService(networkBaseUrl: _gateway.baseUrl);
     _speech = widget.speech ?? SpeechService();
     _vision = widget.vision ?? VisionService();
+    _gimbal = widget.gimbal ?? GimbalService();
+    _faceStream = widget.faceStream ?? FaceStreamService();
+    _gimbalStateSubscription = _gimbal.deviceStates.listen((state) {
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _isGimbalControllable = state.isControllable;
+        _gimbalModel = state.model;
+        _gimbalPhase = state.phase;
+      });
+    });
+    _gimbalErrorSubscription = _gimbal.errors.listen((message) {
+      _logs.warning('gimbal', message);
+      if (!mounted) {
+        return;
+      }
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text(message)));
+    });
     _gatewayHealthService =
         widget.gatewayHealthService ??
         GatewayHealthService(baseUrl: _gateway.debugBaseUrl);
@@ -169,11 +219,21 @@ class _FacePageState extends State<FacePage>
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
     _gatewayHealthTimer?.cancel();
+    _overlayHideTimer?.cancel();
     _visionLoopToken++;
     _voiceWakeController.dispose();
     _animation.dispose();
     _speech.stop();
     _vision.stop();
+    unawaited(_faceStreamSubscription?.cancel());
+    _faceStreamSubscription = null;
+    unawaited(_faceStream.dispose());
+    unawaited(_gimbalStateSubscription?.cancel());
+    unawaited(_gimbalErrorSubscription?.cancel());
+    if (widget.gimbal == null) {
+      unawaited(_gimbal.stop());
+      unawaited(_gimbal.dispose());
+    }
     _tts.stop();
     unawaited(_deviceEventSubscription?.cancel());
     unawaited(_voiceEventSubscription?.cancel());
@@ -205,6 +265,7 @@ class _FacePageState extends State<FacePage>
     _speechToken++;
     _visionLoopToken++;
     await _voiceWakeController.pauseForLifecycle(state.name);
+    await _stopFollow();
     await _tts.stop();
     _voiceWakeController.notifyTtsEnded();
     try {
@@ -304,7 +365,8 @@ class _FacePageState extends State<FacePage>
         } else {
           _voiceWakeController.applyProfile(settings.activeProfile);
         }
-        _showVoiceDebugPanel = settings.showVoiceDebugPanel;
+        // 语音调试面板不跨启动恢复，每次启动默认收起，需要时从控制面板打开
+        _showVoiceDebugPanel = false;
       });
       _logs.info(
         'speech',
@@ -327,7 +389,7 @@ class _FacePageState extends State<FacePage>
         wakeConfig: _voiceWakeController.config,
         audioGateConfig: _voiceWakeController.audioGateConfig,
         bargeInConfig: _voiceWakeController.bargeInConfig,
-        showVoiceDebugPanel: _showVoiceDebugPanel,
+        showVoiceDebugPanel: false,
       ),
     );
     if (!saved) {
@@ -450,6 +512,10 @@ class _FacePageState extends State<FacePage>
   }
 
   Future<bool?> _checkVisualPresence() async {
+    // 本地人脸流在跑时直接复用其结果，避免抢占相机与云端调用。
+    if (_faceStream.isRunning) {
+      return _faceStream.latest?.detected;
+    }
     _logs.info('vision', 'presence scan');
     try {
       final result = await _vision.checkOnce();
@@ -497,6 +563,213 @@ class _FacePageState extends State<FacePage>
       ),
       speakResponse: false,
     );
+  }
+
+  /// 触摸唤出底部输入区，8 秒无操作自动隐藏（沉浸式模式）。
+  void _revealOverlay() {
+    _overlayHideTimer?.cancel();
+    if (!mounted) {
+      return;
+    }
+    if (!_overlayVisible) {
+      setState(() => _overlayVisible = true);
+    }
+    _overlayHideTimer = Timer(const Duration(seconds: 8), () {
+      if (mounted) {
+        setState(() => _overlayVisible = false);
+      }
+    });
+  }
+
+  // ---------------------------------------------------------------- 云台跟随
+
+  /// 开关“云台跟随”：本地人脸流驱动（a）人物唤醒（在场事件）与
+  /// （b）云台速度闭环。无云台时自动退化为纯本地人物唤醒。
+  void _showFollowHint(String message) {
+    if (!mounted) {
+      return;
+    }
+    ScaffoldMessenger.of(
+      context,
+    ).showSnackBar(SnackBar(content: Text(message)));
+  }
+
+  Future<void> _toggleFollow() async {
+    debugPrint(
+      '[follow] toggle: active=$_isFollowActive allowVision=${_settings.allowVision} privacy=${_settings.privacyMode}',
+    );
+    if (_isFollowActive) {
+      await _stopFollow();
+      return;
+    }
+    if (_settings.privacyMode) {
+      _logs.warning('vision', 'follow ignored: privacy mode');
+      _showFollowHint('隐私模式已开启，无法使用云台跟随');
+      return;
+    }
+    if (!_settings.allowVision) {
+      // 自动开启视觉能力：隐私未开时不应让按钮静默失效。
+      _updateSettings(_settings.copyWith(allowVision: true));
+      _showFollowHint('已自动开启"看"，正在启动云台跟随');
+    }
+    if (_gimbal.isSupported && !_isGimbalControllable) {
+      await _connectGimbal();
+    }
+    final streamError = await _faceStream.start();
+    if (streamError != null) {
+      debugPrint('[follow] face stream failed: $streamError');
+      _logs.warning('vision', 'face stream start failed: $streamError');
+      _showFollowHint('跟随启动失败：$streamError');
+      return;
+    }
+    debugPrint(
+      '[follow] active: gimbalControllable=$_isGimbalControllable model=$_gimbalModel',
+    );
+    _followController.reset();
+    _lastFollowCommand = const FollowCommand(
+      phase: FollowPhase.idle,
+      yawDps: 0,
+      pitchDps: 0,
+    );
+    _lastVelocitySentAt = null;
+    _faceStreamSubscription = _faceStream.observations.listen(
+      _handleFaceObservation,
+    );
+    if (!mounted) {
+      return;
+    }
+    setState(() => _isFollowActive = true);
+    _followStartedAt = DateTime.now();
+    _followNoFaceHintShown = false;
+    debugPrint(
+      '[follow] started gimbal=${_isGimbalControllable ? _gimbalModel : "无(仅本地唤醒)"}',
+    );
+    _logs.info(
+      'follow',
+      'start gimbal=${_isGimbalControllable ? _gimbalModel : "无(仅本地唤醒)"}',
+    );
+  }
+
+  Future<void> _connectGimbal() async {
+    try {
+      var state = await _gimbal.register();
+      if (!state.isControllable) {
+        state = await _gimbal.connectBluetooth();
+      }
+      if (mounted) {
+        setState(() => _isGimbalControllable = state.isControllable);
+      }
+      debugPrint(
+        '[gimbal] phase=${state.phase.name} model=${state.model.isEmpty ? "未知" : state.model} controllable=${state.isControllable}',
+      );
+      _logs.info(
+        'gimbal',
+        'phase=${state.phase.name} model=${state.model.isEmpty ? "未知" : state.model}',
+      );
+    } catch (error) {
+      debugPrint('[gimbal] connect failed: $error');
+      _logs.warning('gimbal', 'connect failed: $error');
+    }
+  }
+
+  Future<void> _stopFollow() async {
+    await _faceStreamSubscription?.cancel();
+    _faceStreamSubscription = null;
+    await _faceStream.release();
+    _followController.reset();
+    _presenceTracker.reset();
+    if (_isGimbalControllable) {
+      try {
+        await _gimbal.stop();
+      } catch (_) {}
+    }
+    if (!mounted) {
+      return;
+    }
+    setState(() => _isFollowActive = false);
+    _logs.info('follow', 'stop');
+  }
+
+  DateTime? _lastFollowDiagAt;
+  bool _followNoFaceHintShown = false;
+  DateTime? _followStartedAt;
+
+  void _handleFaceObservation(FaceObservation observation) {
+    final diagNow = DateTime.now();
+    if (_lastFollowDiagAt == null ||
+        diagNow.difference(_lastFollowDiagAt!).inSeconds >= 3) {
+      _lastFollowDiagAt = diagNow;
+      debugPrint(
+        '[follow] face detected=${observation.detected} '
+        'offsetX=${observation.offsetX.toStringAsFixed(3)} '
+        'offsetY=${observation.offsetY.toStringAsFixed(3)}',
+      );
+      _logs.info(
+        'follow',
+        'face detected=${observation.detected} '
+        'offsetX=${observation.offsetX.toStringAsFixed(3)} '
+        'offsetY=${observation.offsetY.toStringAsFixed(3)}',
+      );
+    }
+    if (observation.detected) {
+      _followNoFaceHintShown = false;
+    } else if (_isFollowActive &&
+        !_followNoFaceHintShown &&
+        _followStartedAt != null &&
+        DateTime.now().difference(_followStartedAt!).inSeconds >= 8) {
+      _followNoFaceHintShown = true;
+      _showFollowHint('未检测到人脸：请正对手机前置摄像头（光线充足）');
+    }
+    final presenceEvent = _presenceTracker.update(observation);
+    if (presenceEvent != null) {
+      unawaited(_handleVisionPresenceEvent(presenceEvent));
+    }
+    final command = _followController.update(
+      faceDetected: observation.detected,
+      offsetX: observation.offsetX,
+      offsetY: observation.offsetY,
+      now: observation.timestamp,
+    );
+    _applyFollowCommand(command);
+  }
+
+  Future<void> _handleVisionPresenceEvent(VisionPresenceEvent event) async {
+    final hasPerson = event.type != VisionPresenceEventType.userAbsent;
+    _logs.info(
+      'vision',
+      'local presence ${event.type.name} after=${event.absentDuration.inSeconds}s',
+    );
+    await _handleVisualPresenceChanged(hasPerson);
+  }
+
+  void _applyFollowCommand(FollowCommand command) {
+    if (!_isGimbalControllable) {
+      return;
+    }
+    final now = DateTime.now();
+    final unchanged = command.yawDps == _lastFollowCommand.yawDps &&
+        command.pitchDps == _lastFollowCommand.pitchDps;
+    final stale = _lastVelocitySentAt == null ||
+        now.difference(_lastVelocitySentAt!) >
+            const Duration(milliseconds: 800);
+    if (unchanged && !stale) {
+      return;
+    }
+    _lastFollowCommand = command;
+    _lastVelocitySentAt = now;
+    _logs.info(
+      'follow',
+      'cmd ${command.phase.name} yaw=${command.yawDps.toStringAsFixed(1)} pitch=${command.pitchDps.toStringAsFixed(1)}',
+    );
+    if (command.isNeutral) {
+      unawaited(_gimbal.stop().catchError((_) {}));
+    } else {
+      unawaited(
+        _gimbal
+            .setVelocity(yawDps: command.yawDps, pitchDps: command.pitchDps)
+            .catchError((_) {}),
+      );
+    }
   }
 
   Future<void> _listenAndChat() async {
@@ -650,6 +923,11 @@ class _FacePageState extends State<FacePage>
   }) async {
     _controller.thinking(label: '正在看');
     _logs.info('vision', 'capture start source=$source text=$text');
+    // 人脸流独占相机；拍照前先让出，拍完自动恢复。
+    final wasStreamRunning = _faceStream.isRunning;
+    if (wasStreamRunning) {
+      await _faceStream.release();
+    }
     try {
       final result = await _vision.checkOnce();
       if (!result.ok ||
@@ -681,6 +959,13 @@ class _FacePageState extends State<FacePage>
         await _sendText(text);
       } else {
         _controller.doubleTap();
+      }
+    } finally {
+      if (wasStreamRunning && _isFollowActive) {
+        final restartError = await _faceStream.start();
+        if (restartError != null) {
+          _logs.warning('vision', 'face stream restart failed: $restartError');
+        }
       }
     }
   }
@@ -751,13 +1036,27 @@ class _FacePageState extends State<FacePage>
     }
   }
 
+  Future<RobotResponse> _runGatewayCall(
+    Future<RobotResponse> Function() call,
+  ) async {
+    try {
+      return await call();
+    } catch (error) {
+      _logs.warning('gateway', 'call error: $error');
+      if (mounted) {
+        setState(() => _isBusy = false);
+      }
+      rethrow;
+    }
+  }
+
   Future<void> _applyGatewayCall(
     Future<RobotResponse> Function() call, {
     bool speakResponse = true,
   }) async {
     _controller.thinking(label: '正在想');
     setState(() => _isBusy = true);
-    final response = await call();
+    final response = await _runGatewayCall(call);
     if (!mounted) {
       return;
     }
@@ -804,6 +1103,7 @@ class _FacePageState extends State<FacePage>
     setState(() => _isSpeaking = true);
     await _tts.speak(
       cue.text,
+      persona: _currentPersona,
       style: 'impact',
       speed: cue.speed,
       pitch: cue.pitch,
@@ -840,6 +1140,7 @@ class _FacePageState extends State<FacePage>
     setState(() => _isSpeaking = true);
     await _tts.speak(
       response.text,
+      persona: _currentPersona,
       style: response.voice.style,
       speed: response.voice.speed,
       pitch: response.voice.pitch,
@@ -943,6 +1244,9 @@ class _FacePageState extends State<FacePage>
           isBusy: _isBusy,
           isListening: _isListening,
           isVisionMonitoring: _isVisionMonitoring,
+          isFollowActive: _isFollowActive,
+          isGimbalControllable: _isGimbalControllable,
+          gimbalModel: _gimbalModel,
           showVoiceDebugPanel: _showVoiceDebugPanel,
           voiceState: _voiceState,
           controller: _controller,
@@ -953,6 +1257,7 @@ class _FacePageState extends State<FacePage>
           onListen: _listenAndChat,
           onLook: () => _lookAndAsk(),
           onToggleVisionMonitoring: _toggleVisionMonitoring,
+          onToggleFollow: () => unawaited(_toggleFollow()),
           onToggleVoiceDebugPanel: () {
             setState(() => _showVoiceDebugPanel = !_showVoiceDebugPanel);
             unawaited(_persistVoiceSettings());
@@ -1041,7 +1346,11 @@ class _FacePageState extends State<FacePage>
           body: SafeArea(
             child: Column(
               children: [
-                _StatusBar(
+                Visibility(
+                  visible: _overlayVisible,
+                  maintainState: true,
+                  maintainAnimation: true,
+                  child: _StatusBar(
                   state: state,
                   statusLabel: _activityLabelFor(state),
                   isGatewayOnline: _isGatewayOnline,
@@ -1053,9 +1362,13 @@ class _FacePageState extends State<FacePage>
                   onRefresh: _refreshGatewayStatus,
                   onStopSpeaking: _stopSpeaking,
                   onOpenControls: _showControlPanel,
+                  ),
                 ),
                 Expanded(
-                  child: GestureDetector(
+                  child: Listener(
+                    onPointerDown: (_) => _revealOverlay(),
+                    child: GestureDetector(
+                    key: const ValueKey('robotFaceArea'),
                     behavior: HitTestBehavior.opaque,
                     onTap: () {
                       if (_isSpeaking) {
@@ -1081,15 +1394,21 @@ class _FacePageState extends State<FacePage>
                         },
                       ),
                     ),
+                    ),
                   ),
                 ),
-                _ChatComposer(
+                Visibility(
+                  visible: _overlayVisible,
+                  maintainState: true,
+                  maintainAnimation: true,
+                  child: _ChatComposer(
                   controller: _chatTextController,
                   isBusy: _isBusy,
                   isListening: _isListening,
                   allowSpeechInput: _settings.allowSpeechInput,
                   onSend: _sendChat,
                   onListen: _listenAndChat,
+                  ),
                 ),
                 if (_showVoiceDebugPanel)
                   VoiceDebugPanel(
@@ -1145,6 +1464,24 @@ class _FacePageState extends State<FacePage>
   }
 
   String _activityLabelFor(ExpressionState state) {
+    if (_isFollowActive) {
+      if (_isGimbalControllable) {
+        return '云台跟随中';
+      }
+      final connecting = switch (_gimbalPhase) {
+        GimbalPhase.registering ||
+        GimbalPhase.registered ||
+        GimbalPhase.connecting => true,
+        _ => false,
+      };
+      if (connecting) {
+        return '正在连接云台…';
+      }
+      if (_gimbalPhase == GimbalPhase.error) {
+        return '云台连接失败，仅人物唤醒';
+      }
+      return '人物唤醒中（未连接云台）';
+    }
     if (_isSpeaking) {
       return '正在说话，轻触可打断';
     }
@@ -1409,6 +1746,9 @@ class _ControlPanel extends StatelessWidget {
     required this.isBusy,
     required this.isListening,
     required this.isVisionMonitoring,
+    required this.isFollowActive,
+    required this.isGimbalControllable,
+    required this.gimbalModel,
     required this.showVoiceDebugPanel,
     required this.voiceState,
     required this.controller,
@@ -1419,6 +1759,7 @@ class _ControlPanel extends StatelessWidget {
     required this.onToggleVoiceDebugPanel,
     required this.onToggleVoiceConversation,
     required this.onToggleWakeListening,
+    required this.onToggleFollow,
     required this.onShowMemory,
     required this.onShowLogs,
     required this.onShowDeviceCheck,
@@ -1429,6 +1770,9 @@ class _ControlPanel extends StatelessWidget {
   final bool isBusy;
   final bool isListening;
   final bool isVisionMonitoring;
+  final bool isFollowActive;
+  final bool isGimbalControllable;
+  final String gimbalModel;
   final bool showVoiceDebugPanel;
   final VoiceState voiceState;
   final FaceController controller;
@@ -1436,6 +1780,7 @@ class _ControlPanel extends StatelessWidget {
   final VoidCallback onListen;
   final VoidCallback onLook;
   final VoidCallback onToggleVisionMonitoring;
+  final VoidCallback onToggleFollow;
   final VoidCallback onToggleVoiceDebugPanel;
   final VoidCallback onToggleVoiceConversation;
   final VoidCallback onToggleWakeListening;
@@ -1461,6 +1806,15 @@ class _ControlPanel extends StatelessWidget {
               spacing: 8,
               runSpacing: 8,
               children: [
+                _PanelAction(
+                  key: const ValueKey('toggleGimbalFollow'),
+                  icon: isFollowActive
+                      ? Icons.follow_the_signs
+                      : Icons.control_camera,
+                  label: isFollowActive ? '停止跟随' : '云台跟随',
+                  onPressed: onToggleFollow,
+                  emphasized: true,
+                ),
                 _PanelAction(
                   key: const ValueKey('toggleWakeListening'),
                   icon: isMonitoring ? Icons.radar : Icons.hearing,
@@ -1513,6 +1867,14 @@ class _ControlPanel extends StatelessWidget {
                 ),
               ],
             ),
+            if (isFollowActive && isGimbalControllable && gimbalModel.isNotEmpty)
+              Padding(
+                padding: const EdgeInsets.only(top: 4),
+                child: Text(
+                  '云台已连接：$gimbalModel',
+                  style: Theme.of(context).textTheme.bodySmall,
+                ),
+              ),
             const SizedBox(height: 18),
             _SettingsDock(
               settings: settings,
@@ -1540,14 +1902,23 @@ class _PanelAction extends StatelessWidget {
     required this.icon,
     required this.label,
     required this.onPressed,
+    this.emphasized = false,
   });
 
   final IconData icon;
   final String label;
   final VoidCallback? onPressed;
+  final bool emphasized;
 
   @override
   Widget build(BuildContext context) {
+    if (emphasized) {
+      return FilledButton.icon(
+        onPressed: onPressed,
+        icon: Icon(icon, size: 18),
+        label: Text(label),
+      );
+    }
     return FilledButton.tonalIcon(
       onPressed: onPressed,
       icon: Icon(icon, size: 18),

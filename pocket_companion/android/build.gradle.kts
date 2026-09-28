@@ -1,5 +1,9 @@
 allprojects {
     repositories {
+        // 国内网络对 repo1.maven.org / dl.google.com 不稳定时优先走阿里云镜像
+        maven("https://maven.aliyun.com/repository/google")
+        maven("https://maven.aliyun.com/repository/central")
+        maven("https://maven.aliyun.com/repository/gradle-plugin")
         google()
         mavenCentral()
     }

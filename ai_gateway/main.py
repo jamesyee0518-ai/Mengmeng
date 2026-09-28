@@ -24,6 +24,10 @@ LMSTUDIO_ENABLED = os.environ.get("LMSTUDIO_ENABLED", "0").lower() in {
 }
 LMSTUDIO_BASE_URL = os.environ.get("LMSTUDIO_BASE_URL", "http://127.0.0.1:1234/v1").rstrip("/")
 LMSTUDIO_MODEL = os.environ.get("LMSTUDIO_MODEL", "qwen3-vl-8b-instruct")
+# 云端 OpenAI 兼容服务（MiniMax 等）：Bearer 鉴权 + 可配置聊天路径。
+# MiniMax: BASE_URL=https://api.minimaxi.com/v1, CHAT_PATH=/text/chatcompletion_v2
+LMSTUDIO_API_KEY = os.environ.get("LMSTUDIO_API_KEY", "").strip()
+LMSTUDIO_CHAT_PATH = os.environ.get("LMSTUDIO_CHAT_PATH", "/chat/completions")
 LMSTUDIO_TIMEOUT = float(os.environ.get("LMSTUDIO_TIMEOUT", "12"))
 LMSTUDIO_TEMPERATURE = float(os.environ.get("LMSTUDIO_TEMPERATURE", "0.2"))
 LMSTUDIO_MAX_TOKENS = int(os.environ.get("LMSTUDIO_MAX_TOKENS", "96"))
@@ -36,6 +40,10 @@ LMSTUDIO_NO_THINK = os.environ.get("LMSTUDIO_NO_THINK", "0").lower() in {
 WHISPER_CLI = os.environ.get("WHISPER_CLI", "whisper-cli")
 WHISPER_MODEL = os.environ.get("WHISPER_MODEL", os.path.expanduser("~/Models/whisper/ggml-small.bin"))
 WHISPER_TIMEOUT = float(os.environ.get("WHISPER_TIMEOUT", "45"))
+# 语音引擎：whisper（本机 whisper-cli，回退用）| funasr_http（Ubuntu 服务器 mengmeng_speech）
+STT_ENGINE = os.environ.get("STT_ENGINE", "whisper").strip().lower()
+SPEECH_BASE_URL = os.environ.get("SPEECH_BASE_URL", "http://192.168.11.10:8801").rstrip("/")
+SPEECH_TIMEOUT = float(os.environ.get("SPEECH_TIMEOUT", "90"))
 WHISPER_PROMPT = os.environ.get(
     "WHISPER_PROMPT",
     "以下是一段中文普通话语音，可能包含对智能助手的称呼，例如“萌萌”“小远”“群群老师”，也可能只是普通对话。请准确转写，不要补全没有听到的内容。",
@@ -403,6 +411,8 @@ class LmStudioClient:
         temperature=LMSTUDIO_TEMPERATURE,
         max_tokens=LMSTUDIO_MAX_TOKENS,
         no_think=LMSTUDIO_NO_THINK,
+        api_key=LMSTUDIO_API_KEY,
+        chat_path=LMSTUDIO_CHAT_PATH,
     ):
         self.enabled = enabled
         self.base_url = base_url
@@ -411,6 +421,8 @@ class LmStudioClient:
         self.temperature = temperature
         self.max_tokens = max_tokens
         self.no_think = no_think
+        self.api_key = api_key
+        self.chat_path = chat_path if chat_path.startswith("/") else f"/{chat_path}"
         self.last_error = ""
 
     def status(self):
@@ -418,6 +430,8 @@ class LmStudioClient:
             "enabled": self.enabled,
             "base_url": self.base_url,
             "model": self.model,
+            "chat_path": self.chat_path,
+            "has_api_key": bool(self.api_key),
             "last_error": self.last_error,
         }
 
@@ -454,7 +468,7 @@ class LmStudioClient:
         }
         try:
             _log_lmstudio_payload("chat", payload)
-            response = self._post("/chat/completions", payload)
+            response = self._post(self.chat_path, payload)
             content = (
                 response.get("choices", [{}])[0]
                 .get("message", {})
@@ -495,7 +509,7 @@ class LmStudioClient:
         try:
             print(f"[gateway] lmstudio vision prompt={prompt!r}", flush=True)
             _log_lmstudio_payload("vision", payload)
-            response = self._post("/chat/completions", payload)
+            response = self._post(self.chat_path, payload)
             content = (
                 response.get("choices", [{}])[0]
                 .get("message", {})
@@ -533,12 +547,20 @@ class LmStudioClient:
             return text
         return f"{text}\n/no_think"
 
+    def _headers(self, extra=None):
+        headers = {"content-type": "application/json"}
+        if self.api_key:
+            headers["authorization"] = f"Bearer {self.api_key}"
+        if extra:
+            headers.update(extra)
+        return headers
+
     def _post(self, path, payload):
         data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         req = request.Request(
             f"{self.base_url}{path}",
             data=data,
-            headers={"content-type": "application/json"},
+            headers=self._headers(),
             method="POST",
         )
         with request.urlopen(req, timeout=self.timeout) as response:
@@ -546,7 +568,11 @@ class LmStudioClient:
         return json.loads(raw)
 
     def _get(self, path):
-        req = request.Request(f"{self.base_url}{path}", method="GET")
+        req = request.Request(
+            f"{self.base_url}{path}",
+            headers=self._headers(),
+            method="GET",
+        )
         with request.urlopen(req, timeout=self.timeout) as response:
             raw = response.read().decode("utf-8")
         return json.loads(raw)
@@ -595,6 +621,8 @@ def _extract_json_object(raw):
 def _extract_model_text(raw):
     if not isinstance(raw, str):
         return ""
+    # 推理模型经 OpenAI 标准路径返回时会把思考过程内联在 <think>...</think> 中
+    raw = re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL | re.IGNORECASE).strip()
     parsed = _extract_json_object(raw)
     if isinstance(parsed, dict) and isinstance(parsed.get("text"), str):
         raw = parsed["text"]
@@ -880,6 +908,104 @@ def consume_recent_stt_text(max_age_seconds=20):
     return text
 
 
+def _transcribe_via_funasr_http(audio_bytes, audio_format):
+    """POST 原始音频到服务器 FunASR；失败返回 None 由调用方回退 whisper。"""
+    url = f"{SPEECH_BASE_URL}/stt?format={audio_format}"
+    try:
+        req = request.Request(
+            url,
+            data=audio_bytes,
+            headers={"content-type": "application/octet-stream"},
+            method="POST",
+        )
+        with request.urlopen(req, timeout=SPEECH_TIMEOUT) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+        if not payload.get("ok"):
+            print(f"[gateway] funasr_http not ok: {payload.get('error')}", flush=True)
+            return None
+        text = str(payload.get("text", "")).strip()
+        if not text:
+            return _empty_stt_response("empty_text", ["funasr_empty"], "empty_text")
+        return {
+            "ok": True,
+            "text": text,
+            "raw_text": text,
+            "normalized_text": _compact_zh_text(text),
+            "cleaned": True,
+            "flags": ["funasr"],
+            "error": "",
+        }
+    except Exception as exc:
+        print(f"[gateway] funasr_http error: {exc}", flush=True)
+        return None
+
+
+# 说话人/风格 -> edge-tts 音色（服务器 mengmeng_speech 支持：xiaoxiao/xiaoyi/yunxi）
+TTS_VOICE_BY_PERSONA = {
+    "mengmeng": "xiaoxiao",
+    "xiaoyuan": "yunxi",
+    "qunqun_teacher": "xiaoyi",
+}
+TTS_VOICE_BY_STYLE = {
+    "warm": "xiaoxiao",
+    "lively": "xiaoxiao",
+    "soft": "xiaoyi",
+    "gentle": "xiaoyi",
+    "calm": "yunxi",
+    "male": "yunxi",
+}
+
+
+def _edge_voice_for(payload):
+    for key in ("voice", "persona", "style"):
+        value = str(payload.get(key, "") or "").strip().lower()
+        if not value:
+            continue
+        if value in ("xiaoxiao", "xiaoyi", "yunxi"):
+            return value
+        if value in TTS_VOICE_BY_PERSONA:
+            return TTS_VOICE_BY_PERSONA[value]
+        if value in TTS_VOICE_BY_STYLE:
+            return TTS_VOICE_BY_STYLE[value]
+    return "xiaoxiao"
+
+
+def _edge_rate_for_speed(speed):
+    """App 的 speed(0.4-1.0) -> edge-tts 语速百分比。"""
+    try:
+        speed = float(speed)
+    except (TypeError, ValueError):
+        speed = 1.0
+    speed = max(0.5, min(1.2, speed))
+    return f"{int(round((speed - 1.0) * 100)):+d}%"
+
+
+def _tts_via_speech_server(text, voice, rate="+0%"):
+    body = json.dumps(
+        {"text": text, "voice": voice, "rate": rate}, ensure_ascii=False
+    ).encode("utf-8")
+    try:
+        req = request.Request(
+            f"{SPEECH_BASE_URL}/tts",
+            data=body,
+            headers={"content-type": "application/json"},
+            method="POST",
+        )
+        with request.urlopen(req, timeout=SPEECH_TIMEOUT) as response:
+            return response.read(), None
+    except Exception as exc:
+        return None, f"tts_failed:{exc}"
+
+
+def _speech_server_alive(timeout=4.0):
+    try:
+        req = request.Request(f"{SPEECH_BASE_URL}/health", method="GET")
+        with request.urlopen(req, timeout=timeout) as response:
+            return json.loads(response.read().decode("utf-8")).get("ok") is True
+    except Exception:
+        return False
+
+
 def transcribe_audio(audio_bytes, audio_format="m4a"):
     audio_format = re.sub(r"[^a-zA-Z0-9]", "", audio_format or "m4a")[:8] or "m4a"
     if not audio_bytes:
@@ -890,6 +1016,11 @@ def transcribe_audio(audio_bytes, audio_format="m4a"):
             ["too_short_audio"],
             "too_short_audio",
         )
+    if STT_ENGINE == "funasr_http":
+        result = _transcribe_via_funasr_http(audio_bytes, audio_format)
+        if result is not None:
+            return result
+        print("[gateway] funasr_http unavailable, falling back to whisper", flush=True)
     if not os.path.exists(WHISPER_MODEL):
         return {"ok": False, "text": "", "error": f"missing_model:{WHISPER_MODEL}"}
     with tempfile.TemporaryDirectory(prefix="mengmeng_stt_") as tmpdir:
@@ -1508,6 +1639,8 @@ def gateway_diagnostics():
         },
         "lmstudio": lmstudio,
         "stt": {
+            "engine": STT_ENGINE,
+            "speech_base_url": SPEECH_BASE_URL,
             "whisper_cli": WHISPER_CLI,
             "whisper_cli_path": whisper_cli_path or "",
             "whisper_cli_ok": bool(whisper_cli_path),
@@ -1533,30 +1666,38 @@ def gateway_health():
     ffmpeg_path = shutil.which(FFMPEG_BIN)
     whisper_cli_path = shutil.which(WHISPER_CLI)
     model_path_exists = os.path.exists(WHISPER_MODEL)
+    speech_alive = _speech_server_alive()
     stt_reason = None
-    if not ffmpeg_path:
-        stt_reason = "ffmpeg_unavailable"
-    elif not whisper_cli_path:
-        stt_reason = "whisper_cli_unavailable"
-    elif not model_path_exists:
-        stt_reason = f"missing_model:{WHISPER_MODEL}"
+    if STT_ENGINE == "funasr_http":
+        if speech_alive:
+            if not ffmpeg_path:
+                stt_reason = "ffmpeg_unavailable"
+        elif not (ffmpeg_path and whisper_cli_path and model_path_exists):
+            # 服务器不可达且本机 whisper 回退链路不完整才算故障
+            stt_reason = "funasr_unreachable_and_no_whisper_fallback"
+    else:
+        if not ffmpeg_path:
+            stt_reason = "ffmpeg_unavailable"
+        elif not whisper_cli_path:
+            stt_reason = "whisper_cli_unavailable"
+        elif not model_path_exists:
+            stt_reason = f"missing_model:{WHISPER_MODEL}"
     stt_ok = stt_reason is None
 
     llm_reachable = True
     llm_reason = None
     if lmstudio_client.enabled:
-        try:
-            req = request.Request(f"{lmstudio_client.base_url}/models", method="GET")
-            with request.urlopen(req, timeout=HEALTH_CHECK_TIMEOUT) as response:
-                llm_reachable = 200 <= response.status < 300
-            if not llm_reachable:
-                llm_reason = "llm_unavailable"
-        except Exception as exc:
-            llm_reachable = False
-            llm_reason = exc.__class__.__name__
+        # 复用客户端探测（带 Bearer 鉴权；MiniMax 的 /v1/models 需要鉴权）
+        probe = lmstudio_client.health()
+        llm_reachable = bool(probe.get("ok"))
+        if not llm_reachable:
+            llm_reason = probe.get("reason") or "llm_unavailable"
     llm_ok = llm_reachable
 
     tts_ok = True
+    tts_reason = None
+    # edge-tts 在语音服务器上；不可达时手机端自动退回系统 TTS
+    tts_provider = "edge-tts" if speech_alive else "system"
     health = {
         "ok": bool(stt_ok and llm_ok and tts_ok),
         "gateway": {
@@ -1566,7 +1707,9 @@ def gateway_health():
         },
         "stt": {
             "ok": stt_ok,
-            "engine": "whisper-cli",
+            "engine": STT_ENGINE if STT_ENGINE == "funasr_http" else "whisper-cli",
+            "funasrReachable": speech_alive if STT_ENGINE == "funasr_http" else None,
+            "speechBaseUrl": SPEECH_BASE_URL,
             "ffmpeg": bool(ffmpeg_path),
             "whisperCli": bool(whisper_cli_path),
             "modelPathExists": model_path_exists,
@@ -1581,8 +1724,8 @@ def gateway_health():
         },
         "tts": {
             "ok": tts_ok,
-            "provider": "system",
-            "reason": None,
+            "provider": tts_provider,
+            "reason": tts_reason,
         },
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
@@ -1640,6 +1783,29 @@ class GatewayHandler(BaseHTTPRequestHandler):
             self._json(result, status=200 if result.get("ok") else 422)
             return
         payload = self._read_json()
+        if self.path == "/tts":
+            text = str(payload.get("text", "")).strip()
+            if not text:
+                self._json({"ok": False, "error": "empty_text"}, status=400)
+                return
+            voice = _edge_voice_for(payload)
+            rate = _edge_rate_for_speed(payload.get("speed"))
+            audio, err = _tts_via_speech_server(text, voice, rate=rate)
+            print(
+                f"[gateway] tts chars={len(text)} voice={voice} rate={rate} "
+                f"bytes={len(audio) if audio else 0} err={err}",
+                flush=True,
+            )
+            if audio is None:
+                self._json({"ok": False, "error": err}, status=502)
+                return
+            self.send_response(200)
+            self._cors_headers()
+            self.send_header("content-type", "audio/mpeg")
+            self.send_header("content-length", str(len(audio)))
+            self.end_headers()
+            self.wfile.write(audio)
+            return
         if self.path == "/chat":
             if payload.get("debug_mode") == "bad_json":
                 self.send_response(200)

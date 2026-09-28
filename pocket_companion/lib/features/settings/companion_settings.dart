@@ -38,15 +38,20 @@ class CompanionSettings {
     bool? keepAwake,
   }) {
     final nextPrivacyMode = privacyMode ?? this.privacyMode;
+    final privacyJustDisabled = this.privacyMode && !nextPrivacyMode;
     return CompanionSettings(
       allowSpeechInput: nextPrivacyMode
           ? false
-          : allowSpeechInput ?? this.allowSpeechInput,
+          : allowSpeechInput ?? (privacyJustDisabled ? true : this.allowSpeechInput),
       allowSpeechOutput: nextPrivacyMode
           ? false
-          : allowSpeechOutput ?? this.allowSpeechOutput,
-      allowVision: nextPrivacyMode ? false : allowVision ?? this.allowVision,
-      allowMemory: nextPrivacyMode ? false : allowMemory ?? this.allowMemory,
+          : allowSpeechOutput ?? (privacyJustDisabled ? true : this.allowSpeechOutput),
+      allowVision: nextPrivacyMode
+          ? false
+          : allowVision ?? (privacyJustDisabled ? true : this.allowVision),
+      allowMemory: nextPrivacyMode
+          ? false
+          : allowMemory ?? (privacyJustDisabled ? true : this.allowMemory),
       privacyMode: nextPrivacyMode,
       keepAwake: keepAwake ?? this.keepAwake,
     );

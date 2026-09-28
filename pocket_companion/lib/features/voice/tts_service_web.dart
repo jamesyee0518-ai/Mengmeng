@@ -5,6 +5,8 @@ import 'dart:async';
 import 'dart:html' as html;
 
 class TtsService {
+  TtsService({String? networkBaseUrl});
+
   Completer<void>? _activeCompleter;
 
   Future<void> speak(
@@ -13,6 +15,7 @@ class TtsService {
     double speed = 0.95,
     double pitch = 1.0,
     double volume = 0.75,
+    String persona = 'mengmeng',
   }) async {
     await stop();
     final synth = html.window.speechSynthesis;

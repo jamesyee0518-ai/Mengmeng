@@ -5,10 +5,14 @@ import android.content.pm.PackageManager
 import android.media.AudioFormat
 import android.media.AudioRecord
 import android.media.MediaRecorder
+import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
 import android.provider.Settings
+import androidx.core.view.WindowCompat
+import androidx.core.view.WindowInsetsCompat
+import androidx.core.view.WindowInsetsControllerCompat
 import java.io.File
 import java.util.concurrent.atomic.AtomicBoolean
 import io.flutter.embedding.android.FlutterActivity
@@ -22,9 +26,31 @@ class MainActivity : FlutterActivity() {
     private val sherpaAudioRunning = AtomicBoolean(false)
     private var sherpaAudioThread: Thread? = null
     private var sherpaAudioSink: EventChannel.EventSink? = null
+    private val djiGimbalPlugin = DjiGimbalPlugin()
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        hideSystemStatusBar()
+    }
+
+    override fun onWindowFocusChanged(hasFocus: Boolean) {
+        super.onWindowFocusChanged(hasFocus)
+        // 从设置/权限弹窗等返回时状态栏会重新出现，聚焦时再隐藏
+        if (hasFocus) hideSystemStatusBar()
+    }
+
+    private fun hideSystemStatusBar() {
+        val window = window ?: return
+        WindowCompat.setDecorFitsSystemWindows(window, false)
+        val controller = WindowCompat.getInsetsController(window, window.decorView)
+        controller.hide(WindowInsetsCompat.Type.statusBars())
+        controller.systemBarsBehavior =
+            WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+    }
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
+        djiGimbalPlugin.attach(this, flutterEngine)
         MethodChannel(
             flutterEngine.dartExecutor.binaryMessenger,
             "pocket_companion/device_capabilities"
@@ -78,6 +104,20 @@ class MainActivity : FlutterActivity() {
                 stopSherpaAudio()
             }
         })
+    }
+
+    override fun onDestroy() {
+        djiGimbalPlugin.detach()
+        super.onDestroy()
+    }
+
+    override fun onRequestPermissionsResult(
+        requestCode: Int,
+        permissions: Array<out String>,
+        grantResults: IntArray,
+    ) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        djiGimbalPlugin.onRequestPermissionsResult(requestCode)
     }
 
     private fun startSherpaAudio(): Map<String, Any> {

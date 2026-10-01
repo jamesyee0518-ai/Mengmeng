@@ -194,7 +194,10 @@ class WakeWordMatcher {
     if (right == null) {
       return left;
     }
-    if (left == null || right.score > left.score) {
+    if (left == null ||
+        right.score > left.score ||
+        (right.score == left.score &&
+            right.wakeWord.length > left.wakeWord.length)) {
       return right;
     }
     return left;
@@ -248,7 +251,7 @@ class WakeWordMatcher {
 const _profiles = [
   WakeWordProfile(
     persona: 'mengmeng',
-    primaryWords: ['萌萌', '萌萌呀', '你好萌萌', '萌萌在吗'],
+    primaryWords: ['萌萌', '萌萌呀', '你好萌萌', '萌萌在吗', '小易', '你好小易', '小易小易'],
     aliasWords: ['梦梦', '夢夢', '蒙蒙', '濛濛', '朦朦', '萌妹'],
     fuzzyWords: ['萌', '妹妹', '么么', '农农', '農農'],
   ),

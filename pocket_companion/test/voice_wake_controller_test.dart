@@ -14,6 +14,114 @@ import 'package:pocket_companion/features/voice/wake_detector.dart';
 import 'package:pocket_companion/features/voice/wake_detector_type.dart';
 
 void main() {
+  test(
+    'default playback cannot be interrupted by energy-only microphone input',
+    () async {
+      final speech = _FakeSpeechService();
+      final controller = VoiceWakeController(
+        speech: speech,
+        bargeInConfig: const BargeInConfig(
+          postTtsStartGracePeriod: Duration(milliseconds: 1),
+        ),
+      );
+      controller.notifyTtsStarted();
+      await Future<void>.delayed(const Duration(milliseconds: 30));
+      expect(speech.bargeInCalls, 0);
+      expect(controller.state, VoiceState.speaking);
+      controller.notifyTtsEnded();
+      controller.dispose();
+    },
+  );
+
+  test('ordinary playback does not open a conversation session', () {
+    final controller = _controller(_FakeSpeechService());
+    controller.notifyTtsStarted();
+    expect(controller.mode, VoiceMode.off);
+    controller.notifyTtsEnded();
+    expect(controller.state, VoiceState.idle);
+    expect(controller.mode, VoiceMode.off);
+    controller.dispose();
+  });
+
+  test('wake mode stays stable while capturing and playing audio', () async {
+    final controller = _controller(
+      _FakeSpeechService(listenOnceDelay: const Duration(milliseconds: 100)),
+    );
+    await controller.start();
+    await Future<void>.delayed(const Duration(milliseconds: 10));
+    expect(controller.state, VoiceState.recording);
+    expect(controller.mode, VoiceMode.wake);
+    controller.notifyTtsStarted();
+    controller.notifyTtsEnded();
+    expect(controller.mode, VoiceMode.wake);
+    expect(controller.state, VoiceState.monitoring);
+    await controller.stop();
+    expect(controller.mode, VoiceMode.off);
+    controller.dispose();
+  });
+
+  test('stop cancels a start waiting for microphone permission', () async {
+    final speech = _DelayedPermissionSpeech();
+    final controller = _controller(speech);
+    final start = controller.start();
+    await controller.stop();
+    speech.permission.complete('granted');
+    await start;
+    expect(controller.mode, VoiceMode.off);
+    expect(controller.state, VoiceState.idle);
+    controller.dispose();
+  });
+
+  test(
+    'manual conversation timeout returns to off, not wake listening',
+    () async {
+      final controller = VoiceWakeController(
+        speech: _FakeSpeechService(),
+        config: const VoiceWakeConfig(
+          conversationIdleTimeout: Duration(milliseconds: 30),
+          monitoringLoopDelay: Duration(milliseconds: 5),
+        ),
+      );
+      await controller.startConversation();
+      await _waitFor(() => controller.state == VoiceState.idle);
+      expect(controller.mode, VoiceMode.off);
+      controller.dispose();
+    },
+  );
+
+  test('conversation releases the local wake microphone', () async {
+    final detector = _FakeWakeDetector(eventsToEmit: []);
+    final speech = _FakeSpeechService(utteranceTexts: ['你好']);
+    final controller = _controller(speech, wakeDetector: detector);
+    await controller.start();
+    expect(detector.running, isTrue);
+    await controller.startConversation();
+    expect(detector.running, isFalse);
+    controller.dispose();
+  });
+
+  test(
+    'waiting for a reply does not consume conversation idle timeout',
+    () async {
+      var ready = false;
+      final controller = VoiceWakeController(
+        speech: _FakeSpeechService(),
+        canListen: () => ready,
+        config: const VoiceWakeConfig(
+          monitoringLoopDelay: Duration(milliseconds: 5),
+          conversationIdleTimeout: Duration(milliseconds: 60),
+        ),
+      );
+      await controller.startConversation();
+      await Future<void>.delayed(const Duration(milliseconds: 120));
+      expect(controller.state, VoiceState.conversation);
+      ready = true;
+      await Future<void>.delayed(const Duration(milliseconds: 10));
+      expect(controller.state, isNot(VoiceState.monitoring));
+      controller.dispose();
+    },
+  );
+
   test('start enters monitoring', () async {
     final speech = _FakeSpeechService();
     final controller = _controller(speech);
@@ -337,6 +445,7 @@ VoiceWakeController _controller(
   return VoiceWakeController(
     speech: speech,
     wakeDetector: wakeDetector,
+    allowAcousticBargeIn: true,
     config: const VoiceWakeConfig(
       monitoringListenDuration: Duration(milliseconds: 5),
       monitoringLoopDelay: Duration(milliseconds: 10),
@@ -387,6 +496,7 @@ class _FakeSpeechService extends SpeechService {
 
   final Queue<String?> _wakeTexts;
   final Queue<String?> _utteranceTexts;
+  int bargeInCalls = 0;
   final Queue<BargeInResult> _bargeInResults;
   final Duration _bargeInDelay;
   final Duration _listenOnceDelay;
@@ -432,6 +542,7 @@ class _FakeSpeechService extends SpeechService {
 
   @override
   Future<BargeInResult> listenForBargeIn(BargeInConfig config) async {
+    bargeInCalls++;
     await Future<void>.delayed(_bargeInDelay);
     return _bargeInResults.isEmpty
         ? const BargeInResult(
@@ -457,6 +568,7 @@ class _FakeWakeDetector implements WakeDetector {
   final Queue<WakeDetectorEvent> _eventsToEmit;
   final _controller = StreamController<WakeDetectorEvent>.broadcast();
   bool _disposed = false;
+  bool running = false;
 
   @override
   WakeDetectorType get type => WakeDetectorType.stt;
@@ -465,10 +577,14 @@ class _FakeWakeDetector implements WakeDetector {
   Stream<WakeDetectorEvent> get events => _controller.stream;
 
   @override
-  Future<void> start() async {}
+  Future<void> start() async {
+    running = true;
+  }
 
   @override
-  Future<void> stop() async {}
+  Future<void> stop() async {
+    running = false;
+  }
 
   @override
   Future<void> detectOnce() async {
@@ -483,4 +599,10 @@ class _FakeWakeDetector implements WakeDetector {
     _disposed = true;
     await _controller.close();
   }
+}
+
+class _DelayedPermissionSpeech extends _FakeSpeechService {
+  final permission = Completer<String>();
+  @override
+  Future<String> microphonePermissionStatus() => permission.future;
 }

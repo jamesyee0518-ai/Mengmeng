@@ -57,6 +57,7 @@ class DjiGimbalPlugin {
     @Volatile private var gimbal: dji.sdk.gimbal.Gimbal? = null
     @Volatile private var lastAttitudePushAt = 0L
     private val bluetoothConnecting = HashSet<String>()
+    @Volatile private var searchGeneration = 0
 
     fun attach(activity: Activity, flutterEngine: FlutterEngine) {
         Log.e(TAG, "attach: wiring channels")
@@ -94,6 +95,9 @@ class DjiGimbalPlugin {
     }
 
     fun detach() {
+        searchGeneration += 1
+        mainHandler.removeCallbacksAndMessages(null)
+        bluetoothConnecting.clear()
         try {
             gimbal?.setStateCallback(null)
         } catch (_: Exception) {
@@ -282,17 +286,21 @@ class DjiGimbalPlugin {
 
     /// 返回 false 表示蓝牙连接器不可用。
     private fun startBluetoothSearch(): Boolean {
+        if (activity == null) return false
+        if (gimbal != null) return true
         val connector: BluetoothProductConnector =
             DJISDKManager.getInstance().bluetoothProductConnector ?: return false
         if (!bluetoothConnecting.add(BLE_CONNECT_KEY)) {
             return true
         }
+        val generation = ++searchGeneration
         Log.e(TAG, "searchBluetoothProducts: begin")
         setPhase("connecting")
         val listCallback = object : BluetoothProductConnector.BluetoothDevicesListCallback {
             override fun onUpdate(devices: MutableList<dji.sdk.sdkmanager.BluetoothDevice>) {
                 Log.e(TAG, "ble list onUpdate: count=${devices.size} names=${devices.mapNotNull { it.name }}")
-                if (devices.isEmpty() || !bluetoothConnecting.contains(BLE_CONNECT_KEY)) {
+                if (generation != searchGeneration || gimbal != null ||
+                    devices.isEmpty() || !bluetoothConnecting.contains(BLE_CONNECT_KEY)) {
                     return
                 }
                 val target = devices.firstOrNull { device ->
@@ -307,6 +315,7 @@ class DjiGimbalPlugin {
                     object : CommonCallbacks.CompletionCallback<DJIError> {
                         override fun onResult(error: DJIError?) {
                             Log.e(TAG, "connect onResult: ${error?.description ?: "success"}")
+                            if (generation != searchGeneration || gimbal != null) return
                             if (error != null) {
                                 setPhase("error")
                                 pushEvent(
@@ -326,6 +335,7 @@ class DjiGimbalPlugin {
         connector.searchBluetoothProducts(
             object : CommonCallbacks.CompletionCallback<DJIError> {
                 override fun onResult(error: DJIError?) {
+                    if (generation != searchGeneration || gimbal != null) return
                     Log.e(TAG, "search onResult: ${error?.description ?: "success"}")
                     if (error != null) {
                         bluetoothConnecting.remove(BLE_CONNECT_KEY)
@@ -333,7 +343,11 @@ class DjiGimbalPlugin {
                         if (searchRetryCount < 12 && error.description.contains("busy", ignoreCase = true)) {
                             searchRetryCount += 1
                             Log.e(TAG, "search busy, retry #$searchRetryCount in 6s")
-                            mainHandler.postDelayed({ startBluetoothSearch() }, 6000)
+                            mainHandler.postDelayed({
+                                if (generation == searchGeneration && gimbal == null) {
+                                    startBluetoothSearch()
+                                }
+                            }, 6000)
                             return
                         }
                         setPhase("error")
@@ -348,6 +362,7 @@ class DjiGimbalPlugin {
             },
         )
         mainHandler.postDelayed({
+            if (generation != searchGeneration || gimbal != null) return@postDelayed
             Log.e(TAG, "search timeout reached")
             if (bluetoothConnecting.remove(BLE_CONNECT_KEY)) {
                 connector.setBluetoothDevicesListCallback(null)
@@ -404,7 +419,7 @@ class DjiGimbalPlugin {
                 .pitch(pitchDeg)
                 .roll(Rotation.NO_ROTATION)
                 .mode(RotationMode.ABSOLUTE_ANGLE)
-                .time((durationMs / 100).toDouble())
+                .time(durationMs / 1000.0)
                 .build(),
             result,
         )
@@ -445,19 +460,24 @@ class DjiGimbalPlugin {
                 rotation,
                 object : CommonCallbacks.CompletionCallback<DJIError> {
                     override fun onResult(error: DJIError?) {
-                        Log.e(TAG, "rotate result: ${error?.description ?: "ok"}")
-                        if (error != null) {
-                            pushEvent(
-                                mapOf(
-                                    "type" to "error",
-                                    "message" to "rotate failed: ${error.description}",
+                        mainHandler.post {
+                            val detail = "mode=${rotation.mode} yaw=${rotation.yaw} pitch=${rotation.pitch}"
+                            Log.e(TAG, "rotate result: ${error?.description ?: "ok"} $detail")
+                            if (error == null) {
+                                result.success(null)
+                            } else {
+                                pushEvent(
+                                    mapOf(
+                                        "type" to "error",
+                                        "message" to "rotate failed: ${error.description}",
+                                    )
                                 )
-                            )
+                                result.error("rotate_failed", error.description, detail)
+                            }
                         }
                     }
                 },
             )
-            result.success(null)
         } catch (error: Exception) {
             result.error("rotate_failed", error.message, null)
         }
@@ -475,6 +495,12 @@ class DjiGimbalPlugin {
             val nextGimbal = product.gimbal
             if (nextGimbal != null) {
                 gimbal = nextGimbal
+                searchGeneration += 1
+                bluetoothConnecting.clear()
+                searchRetryCount = 0
+                reconnectAttempts = 0
+                DJISDKManager.getInstance().bluetoothProductConnector
+                    ?.setBluetoothDevicesListCallback(null)
                 setPhase("connected")
                 try {
                     nextGimbal.setStateCallback(gimbalStateCallback)

@@ -24,7 +24,7 @@ export WHISPER_MODEL="${WHISPER_MODEL:-$ROOT_DIR/Models/whisper/ggml-medium.bin}
 # 语音引擎：Ubuntu 服务器 mengmeng_speech（FunASR STT + edge-tts TTS）
 # 服务器不可达时 STT 自动回退本机 whisper；TTS 由手机端回退系统合成
 export STT_ENGINE="${STT_ENGINE:-funasr_http}"
-export SPEECH_BASE_URL="${SPEECH_BASE_URL:-http://192.168.11.10:8801}"
+export SPEECH_BASE_URL="${SPEECH_BASE_URL:-https://aipipeline.hiqer.top/mengmeng/speech}"
 export SPEECH_TIMEOUT="${SPEECH_TIMEOUT:-90}"
 
 cd "$ROOT_DIR"

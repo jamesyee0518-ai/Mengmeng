@@ -13,6 +13,17 @@ sealed class WakeDetectorEvent {
   const WakeDetectorEvent();
 }
 
+class WakeDetectorAudio extends WakeDetectorEvent {
+  const WakeDetectorAudio({
+    required this.durationMs,
+    required this.avgRms,
+    required this.maxRms,
+  });
+  final int durationMs;
+  final double avgRms;
+  final double maxRms;
+}
+
 class WakeDetectorDetected extends WakeDetectorEvent {
   const WakeDetectorDetected({
     required this.persona,

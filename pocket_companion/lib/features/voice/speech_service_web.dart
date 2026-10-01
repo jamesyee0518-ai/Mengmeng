@@ -1,3 +1,4 @@
+import '../../core/network/gateway_config.dart';
 import 'dart:async';
 
 import 'barge_in_config.dart';
@@ -6,6 +7,10 @@ import 'voice_audio_gate_config.dart';
 import 'voice_debug_snapshot.dart';
 
 class SpeechService {
+  SpeechService({this.baseUrl = defaultGatewayBaseUrl});
+
+  final String baseUrl;
+
   Timer? _timer;
   Completer<String?>? _activeCompleter;
   VoiceDebugSnapshot _latestDebugSnapshot = VoiceDebugSnapshot();

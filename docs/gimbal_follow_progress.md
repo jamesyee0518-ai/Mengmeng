@@ -156,3 +156,42 @@ Device: HUAWEI P30 Pro (VOG-AL10), Android 10 / EMUI —— 老权限模型（BL
 - 验证：Flutter 全量测试 110 项通过；Android debug APK 构建成功。
 - 本轮 ADB 未检测到手机，尚未安装或做物理跟踪、方向标定、姿态反馈及超时复测。历史“休眠/未激活”等判断不能替代本轮实测证据。
 - 现场顺序：连接并授权 USB 调试 → 保留数据覆盖安装 → 启动跟随 → 确认 `face detected` 及非零偏差 → 对照 `cmd`、DJI rotate 回调和姿态变化 → 最后测试停止、左右/上下方向及丢失目标行为。
+
+
+## 2026-09-28 USB 实测：连接状态被旧搜索覆盖
+
+- 修复 NV21 的 debug APK 已保留数据覆盖安装到 P30 Pro，启动成功。
+- 本轮日志（手机时间）23:40:30 扫到 OM3，23:40:31 `bindProduct -> connected`；23:40:32 旧 busy 重试又启动搜索；23:40:36 更早的超时任务将状态改成 `disconnected`。因此本轮“未发现云台”有明确的软件竞态证据，不能归因为云台休眠。
+- 修复：每次搜索使用独立 generation，过期的列表/完成/重试/超时回调不再推进状态；连接成功使旧搜索失效，已连接不重新搜索；detach 取消延迟任务并失效旧搜索。
+- 新修复版 Android debug 构建通过，但打包完成时手机 USB 已断开，尚未覆盖安装及验证本次连接状态修复。
+- Gateway：电脑请求默认公网 `/health` 返回 HTTP 200；手机 `dumpsys connectivity` 为 `Active default network: none`，需要手机联网后重测聊天/语音。
+
+
+## 2026-09-29 转动失败实测：仍需验证 SDK 兼容性
+
+- 设备包更新时间：2026-09-29 17:48:39。读取到 18:04:07 `rotate result: Execution of this process has timed out`，18:04:08 `mode=SPEED yaw=8.0 pitch=0.0`。证明转动请求已发出，但没有成功执行证据；不能凭此诊断为待机、未激活或硬件损坏。
+- 修正前提：DJI 官方 Hardware Introduction 支持表列出 Osmo Mobile 和 Osmo Mobile 2，未明确列出 Osmo Mobile 3。SDK 回报通用 `OSMO_MOBILE` 与 BLE 连接成功，不等于 OM3 电机控制兼容性已经确认。
+- 官方支持表：https://developer.dji.com/mobile-sdk/documentation/introduction/product_introduction.html
+- 待现场对照：停止本 App 跟随后，分别测试 DJI Mimo 控制和手柄摇杆。Mimo/摇杆正常时优先排查 SDK/固件兼容及控制协议；两者均异常时再查设备状态。当前未收到对照结果。
+
+
+### 2026-09-29 Mimo 对照与指令链路修正
+
+- 用户确认：DJI Mimo 和手柄摇杆均可正常控制。当前故障优先定位本应用及 SDK 兼容性，不能继续归因为未激活/休眠/电机故障。
+- 对照官方 `MoveGimbalWithSpeedView.java`（每 100ms 重发），发现 App 对相同非零速度会等到 800ms 才重发。改为移动时每个检测帧刷新（约 160ms），仅对零速去重。尚不能据此断言能解决 SDK 超时。
+- 原生 `rotateWithCompletion` 原来调用 SDK 后立刻 `result.success`，现改为 SDK 完成回调中成功或失败；日志附带 mode/yaw/pitch，避免将接受调用误当执行成功。
+- 相关 21 项 Flutter 测试通过，Android debug 构建通过。物理效果需新包安装后复测。
+
+### 2026-09-29 18:12 新包现场回调验证
+
+- 保留数据覆盖安装成功；新进程 PID 20890。18:12:29 开启跟随，320×240 单平面 NV21 帧正常进入检测；18:12:36 记录到 `face detected=true`。
+- 18:12:30–18:12:37 的转动回调连续返回 `ok`，包含正负 yaw、非零 pitch 和零速停止请求；该段日志没有转动超时。此前旧进程的超时不能混入本次结果。
+- 验证：相关 21 项测试、Android 构建及 Flutter 静态分析通过。SDK 指令回调现已成功；实际运动方向、跟随稳定性仍等待用户现场确认。未隔离重连、Mimo 对照和发送频率各因素，因此不单独归因于频率修改。
+
+### 2026-09-29 人在镜头前仍无法识别
+
+- 用户反馈重点为人脸识别不到，并非 SDK 回调再次失败。发现帧旋转角固定为传感器角度，未补偿设备横竖屏；现每帧按镜头方向与设备方向计算旋转，检测坐标使用同一帧的旋转值。检测分辨率由 low 改为 medium。
+- 旋转处理对照维护者示例：https://github.com/flutter-ml/google_ml_kit_flutter/blob/master/packages/example/lib/vision_detector_views/camera_view.dart 。新增前置四方向及后置旋转回归验证。
+- 相机启动/释放串行执行，停止后丢弃未完成检测的旧结果；跟随启动防重复、会话失效后不重新激活。拍照结束释放相机，避免后续跟随争用。
+- 控制面板开关操作后刷新；状态区分启动、等待人脸、已识别人脸；连续 8 秒无人脸才提示，避免正常短暂漏检反复弹提示。
+- 22 项相关测试、静态检查及 Android debug 构建通过。尚需新版本真机确认横竖屏识别效果。

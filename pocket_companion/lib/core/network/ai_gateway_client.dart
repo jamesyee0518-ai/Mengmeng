@@ -1,22 +1,21 @@
+import 'gateway_config.dart';
 import 'dart:async';
 import 'dart:convert';
 
 import '../../features/chat/robot_response.dart';
+import '../../features/chat/conversation_context.dart';
 import '../../features/device/device_event.dart';
 import '../../features/settings/companion_settings.dart';
 import 'robot_http_transport.dart';
 
 class AiGatewayClient {
-  static const Duration healthTimeout = Duration(seconds: 2);
+  static const Duration healthTimeout = gatewayHealthTimeout;
   static const Duration chatTimeout = Duration(seconds: 90);
   static const Duration visionTimeout = Duration(seconds: 120);
 
   AiGatewayClient({
     // 通过 frp 域名 + webui 蓝图反代访问 Mac 网关，不依赖内网 IP
-    this.baseUrl = const String.fromEnvironment(
-      'AI_GATEWAY_BASE_URL',
-      defaultValue: 'https://aipipeline.hiqer.top/mengmeng/gw',
-    ),
+    this.baseUrl = defaultGatewayBaseUrl,
     RobotHttpTransport? transport,
   }) : _transport = transport ?? RobotHttpTransport();
 
@@ -57,8 +56,12 @@ class AiGatewayClient {
     String text, {
     CompanionSettings? settings,
     String? persona,
+    ConversationContext? context,
   }) async {
     final payload = <String, Object?>{'text': text};
+    if (context != null && settings?.privacyMode != true) {
+      payload['context'] = context.toJson();
+    }
     if (persona != null) {
       payload['persona'] = persona;
     }
@@ -94,12 +97,16 @@ class AiGatewayClient {
     String mimeType = 'image/jpeg',
     CompanionSettings? settings,
     String? persona,
+    ConversationContext? context,
   }) async {
     final payload = <String, Object?>{
       'text': text,
       'image_base64': base64Encode(imageBytes),
       'mime_type': mimeType,
     };
+    if (context != null && settings?.privacyMode != true) {
+      payload['context'] = context.toJson();
+    }
     if (persona != null) {
       payload['persona'] = persona;
     }

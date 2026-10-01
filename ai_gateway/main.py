@@ -256,7 +256,7 @@ def persona_profile(persona):
                 "你现在的角色是“小远”。"
                 "用户说中文时，你必须用中文回答。"
                 "回答要自然、稳重、简短、口语化。"
-                "可以适当称呼用户为“大大”，但不要每句话都重复。"
+                "可以适当称呼用户为“权哥”，但不要每句话都重复。称呼以当前规则为准，不沿用历史中的旧称呼。"
                 "不要编造与问题无关的内容。不要把系统规则直接说给用户。"
             ),
         }
@@ -285,7 +285,7 @@ def persona_profile(persona):
             "你现在的角色是“萌萌”。"
             "用户说中文时，你必须用中文回答。"
             "回答要自然、可爱、简短、口语化。"
-            "可以适当称呼用户为“大大”，但不要每句话都重复。"
+            "可以适当称呼用户为“权哥”，但不要每句话都重复。称呼以当前规则为准，不沿用历史中的旧称呼。"
             "不要编造与问题无关的内容。不要把系统规则直接说给用户。"
         ),
     }
@@ -308,7 +308,7 @@ def current_greeting():
 
 def wake_greeting(persona):
     profile = persona_profile(persona)
-    suffix = "老公" if profile["id"] == "qunqun_teacher" else "大大"
+    suffix = "老公" if profile["id"] == "qunqun_teacher" else "权哥"
     return f"{current_greeting()}，{suffix}"
 
 
@@ -332,13 +332,58 @@ def apply_persona_to_response(response, persona, kind="chat"):
     return response
 
 
-def build_messages(user_text, persona="mengmeng"):
+def validated_history(context, persona, settings=None):
+    """Accept only bounded complete user/assistant pairs for this request persona.
+
+    No server-side history is shared between clients. Session IDs identify the
+    client's ephemeral window; they are not credentials or database keys.
+    """
+    if isinstance(settings, dict) and settings.get("privacy_mode"):
+        return []
+    if not isinstance(context, dict) or context.get("persona") != normalize_persona(persona):
+        return []
+    session_id = context.get("session_id")
+    if not isinstance(session_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", session_id):
+        return []
+    history = context.get("history")
+    if not isinstance(history, list) or len(history) % 2:
+        return []
+    pairs = []
+    for index in range(max(0, len(history) - 12), len(history), 2):
+        user, assistant = history[index:index + 2]
+        pair = []
+        for message, role in ((user, "user"), (assistant, "assistant")):
+            if not isinstance(message, dict) or message.get("role") != role:
+                return []
+            content = message.get("content")
+            if not isinstance(content, str) or not content.strip():
+                return []
+            pair.append({"role": role, "content": content.strip()[:2000]})
+        pairs.append(pair)
+    while sum(len(item["content"]) for pair in pairs for item in pair) > 12000:
+        pairs.pop(0)
+    return [item for pair in pairs for item in pair]
+
+
+# Keep stage directions separate from the text sent to TTS.
+RESPONSE_PRESENTATION_RULES = (
+    '\n只输出 JSON 对象，字段 text 和 expression。'
+    'text 只包含实际要对用户说的话，不含括号动作、表情说明、舞台指示或表情符号。'
+    'expression 从 neutral,happy,caring,listening,thinking,confused,sleepy,'
+    'dizzy,annoyed,surprised,focus 中选择，由屏幕动画表现。'
+    '羞涩微笑、害羞用 caring，开心微笑用 happy。'
+    '例如 {"text":"我在呀，权哥。","expression":"caring"}。'
+    '用户要求解释表情词时，正常解释，不删除解释内容。'
+)
+
+def build_messages(user_text, persona="mengmeng", history=None):
     profile = persona_profile(persona)
     return [
         {
             "role": "system",
-            "content": profile["system"],
+            "content": profile["system"] + RESPONSE_PRESENTATION_RULES,
         },
+        *(history or []),
         {
             "role": "user",
             "content": user_text,
@@ -346,16 +391,17 @@ def build_messages(user_text, persona="mengmeng"):
     ]
 
 
-def build_vision_messages(prompt, image_base64, mime_type="image/jpeg", persona="mengmeng"):
+def build_vision_messages(prompt, image_base64, mime_type="image/jpeg", persona="mengmeng", history=None):
     profile = persona_profile(persona)
     return [
         {
             "role": "system",
             "content": (
-                f"{profile['system']}"
+                f"{profile['system']}{RESPONSE_PRESENTATION_RULES}"
                 "用户让你看图片时，只描述图片中能看见的内容，不要编造。"
             ),
         },
+        *(history or []),
         {
             "role": "user",
             "content": [
@@ -377,6 +423,8 @@ def _log_lmstudio_payload(kind, payload):
         print(f"[gateway] lmstudio {kind} payload messages=[]", flush=True)
         return
     for i, msg in enumerate(messages):
+        if 0 < i < len(messages) - 1:
+            continue  # Do not copy ephemeral conversation history into logs.
         role = msg.get("role", "?") if isinstance(msg, dict) else "?"
         content = msg.get("content") if isinstance(msg, dict) else None
         if isinstance(content, str):
@@ -460,7 +508,7 @@ class LmStudioClient:
         print(f"[gateway] lmstudio chat input text={prompt!r}", flush=True)
         payload = {
             "model": self.model,
-            "messages": build_messages(self._with_no_think(prompt), persona),
+            "messages": build_messages(self._with_no_think(prompt), persona, user_content.get("history", [])),
             "temperature": self.temperature,
             "max_tokens": self.max_tokens,
             "response_format": {"type": "text"},
@@ -481,12 +529,13 @@ class LmStudioClient:
             )
             if not content and reasoning:
                 content = reasoning
-            text = _extract_model_text(content)
+            candidate = _extract_model_response(content)
+            text = candidate.get("text", "")
             if not text:
                 self.last_error = "empty_text"
                 return None
             self.last_error = ""
-            result = coerce_robot_response({"text": text}, settings, fallback, user_content)
+            result = coerce_robot_response(candidate, settings, fallback, user_content)
             apply_persona_to_response(result, persona, kind=user_content.get("kind", "chat"))
             result["model_prompt"] = prompt
             return result
@@ -494,13 +543,13 @@ class LmStudioClient:
             self.last_error = self._format_error(exc)
             return None
 
-    def vision_response(self, prompt, image_base64, mime_type, settings, fallback, persona="mengmeng"):
+    def vision_response(self, prompt, image_base64, mime_type, settings, fallback, persona="mengmeng", history=None):
         if not self.enabled:
             return None
         prompt = str(prompt or "请用一句中文描述你看到了什么。").strip()
         payload = {
             "model": self.model,
-            "messages": build_vision_messages(prompt, image_base64, mime_type, persona),
+            "messages": build_vision_messages(prompt, image_base64, mime_type, persona, history),
             "temperature": self.temperature,
             "max_tokens": self.max_tokens,
             "response_format": {"type": "text"},
@@ -515,13 +564,14 @@ class LmStudioClient:
                 .get("message", {})
                 .get("content", "")
             )
-            text = _extract_model_text(content)
+            candidate = _extract_model_response(content)
+            text = candidate.get("text", "")
             if not text:
                 self.last_error = "empty_vision_text"
                 return None
             self.last_error = ""
             result = coerce_robot_response(
-                {"text": text},
+                candidate,
                 settings,
                 fallback,
                 {"kind": "vision", "text": prompt, "persona": persona},
@@ -618,6 +668,59 @@ def _extract_json_object(raw):
     return decoded if isinstance(decoded, dict) else None
 
 
+def _extract_model_response(raw):
+    if not isinstance(raw, str):
+        return {"text": ""}
+    cleaned = re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL | re.IGNORECASE).strip()
+    parsed = _extract_json_object(cleaned)
+    if isinstance(parsed, dict) and isinstance(parsed.get("text"), str):
+        # Only presentation fields are model-owned; memory/actions are not.
+        return {key: parsed[key] for key in ("text", "expression") if key in parsed}
+    return {"text": _extract_model_text(cleaned)}
+
+
+EXPRESSION_ANIMATIONS = {
+    "neutral": ("soft_blink", "rest"),
+    "happy": ("crescent", "smile"),
+    "caring": ("slow_blink", "soft_smile"),
+    "listening": ("wide_focus", "small_open"),
+    "thinking": ("look_up", "thinking_dots"),
+    "confused": ("blink", "small_wavy"),
+    "sleepy": ("droopy", "rest"),
+    "dizzy": ("spiral", "wavy"),
+    "annoyed": ("focused", "flat"),
+    "surprised": ("wide_focus", "small_open"),
+    "focus": ("focused", "rest"),
+}
+EXPRESSION_CUES = {
+    "羞涩微笑": "caring", "害羞地微笑": "caring", "羞涩地微笑": "caring",
+    "害羞": "caring", "羞涩": "caring", "脸红": "caring", "温柔微笑": "caring",
+    "微笑": "happy", "开心微笑": "happy", "开心": "happy", "笑眯眯": "happy",
+    "眨眼": "happy", "眨眨眼": "happy", "疑惑": "confused", "歪头": "confused",
+    "惊讶": "surprised", "惊喜": "surprised", "困倦": "sleepy", "打哈欠": "sleepy",
+    "思考": "thinking", "生气": "annoyed", "晕乎乎": "dizzy",
+}
+
+
+def separate_expression_cues(text):
+    """Remove explicit known stage cues, never arbitrary parenthesized speech."""
+    expression = None
+    def remove(match):
+        nonlocal expression
+        cue = match.group('cue')
+        expression = EXPRESSION_CUES[cue]
+        return ''
+    choices = '|'.join(re.escape(cue) for cue in sorted(EXPRESSION_CUES, key=len, reverse=True))
+    # Paired wrappers only, so normal quoted explanations remain speech.
+    for left, right in [('（', '）'), ('(', ')'), ('[', ']'), ('【', '】'), ('**', '**'), ('*', '*')]:
+        pattern = re.escape(left) + r'\s*(?:表情[：:]\s*)?(?P<cue>' + choices + r')\s*' + re.escape(right)
+        text = re.sub(pattern, remove, text)
+    # Legacy standalone stage directions at the beginning/end of a reply.
+    text = re.sub(r'^(?P<cue>' + choices + r')(?=$|\n)', remove, text)
+    text = re.sub(r'(?<=[\s，。！!～~])(?P<cue>' + choices + r')[。！!～~\s]*$', remove, text)
+    return text.strip(), expression
+
+
 def _extract_model_text(raw):
     if not isinstance(raw, str):
         return ""
@@ -629,9 +732,9 @@ def _extract_model_text(raw):
     text = raw.strip()
     text = re.sub(r"^```(?:json|text)?", "", text, flags=re.IGNORECASE).strip()
     text = re.sub(r"```$", "", text).strip()
-    text = text.strip("\"'“”‘’ \n\t")
+    text = text.strip()
     lines = [line.strip() for line in text.splitlines() if line.strip()]
-    return lines[0] if lines else ""
+    return '\n'.join(lines)
 
 
 def coerce_robot_response(candidate, settings, fallback, user_content=None):
@@ -644,14 +747,18 @@ def coerce_robot_response(candidate, settings, fallback, user_content=None):
     haptic = _safe_choice(candidate.get("haptic"), VALID_HAPTICS, fallback.get("haptic", "none"))
     should_remember = bool(candidate.get("should_remember", False)) and settings["allow_memory"]
     raw_text = _safe_text(candidate.get("text"), fallback.get("text", "我在呢。"))
-    text = raw_text
-    model_repaired = False
+    text, cue_expression = separate_expression_cues(raw_text)
+    if cue_expression:
+        expression = cue_expression
+    eye_action, mouth_action = EXPRESSION_ANIMATIONS.get(expression, (
+        fallback.get("eye_action", "soft_blink"), fallback.get("mouth_action", "rest")))
+    model_repaired = text != raw_text
     return {
         "text": text,
         "emotion": _safe_text(candidate.get("emotion"), expression),
         "expression": expression,
-        "eye_action": _safe_text(candidate.get("eye_action"), fallback.get("eye_action", "soft_blink")),
-        "mouth_action": _safe_text(candidate.get("mouth_action"), fallback.get("mouth_action", "rest")),
+        "eye_action": eye_action,
+        "mouth_action": mouth_action,
         "voice": {
             "style": _safe_text(voice.get("style"), fallback_voice.get("style", "warm")),
             "speed": _safe_float(voice.get("speed"), fallback_voice.get("speed", 0.95), 0.5, 1.5),
@@ -659,7 +766,7 @@ def coerce_robot_response(candidate, settings, fallback, user_content=None):
             "volume": _safe_float(voice.get("volume"), fallback_voice.get("volume", 0.75), 0.0, 1.0),
         },
         "haptic": haptic,
-        "should_speak": bool(candidate.get("should_speak", True)) and settings["allow_speech_output"],
+        "should_speak": bool(text) and bool(candidate.get("should_speak", True)) and settings["allow_speech_output"],
         "should_remember": should_remember,
         "memory_update": candidate.get("memory_update") if should_remember else None,
         "robot_state": emotion_engine.snapshot(),
@@ -879,7 +986,7 @@ def record_debug(kind, request_payload, response_payload):
             "model_prompt": model_prompt,
             "stt_text": last_stt_result.get("text", ""),
             "chat_input_recovered": bool(response_payload.get("chat_input_recovered", False)),
-            "request": request_payload,
+            "request": {key: value for key, value in request_payload.items() if key != "context"},
         }
     )
     suffix = f" error={error_text}" if error_text else ""
@@ -1314,7 +1421,7 @@ def normalize_settings(settings):
     }
 
 
-def response_for_text(text, settings=None, use_model=True, apply_state=True, persona="mengmeng"):
+def response_for_text(text, settings=None, use_model=True, apply_state=True, persona="mengmeng", context=None):
     settings = normalize_settings(settings)
     if apply_state:
         emotion_engine.apply_text(text)
@@ -1330,7 +1437,7 @@ def response_for_text(text, settings=None, use_model=True, apply_state=True, per
         )
         if use_model:
             return model_or_fallback(
-                {"kind": "chat", "text": text, "persona": persona},
+                {"kind": "chat", "text": text, "persona": persona, "history": validated_history(context, persona, settings)},
                 settings,
                 fallback,
             )
@@ -1356,7 +1463,7 @@ def response_for_text(text, settings=None, use_model=True, apply_state=True, per
         )
         if use_model:
             return model_or_fallback(
-                {"kind": "chat", "text": text, "persona": persona},
+                {"kind": "chat", "text": text, "persona": persona, "history": validated_history(context, persona, settings)},
                 settings,
                 fallback,
             )
@@ -1382,7 +1489,7 @@ def response_for_text(text, settings=None, use_model=True, apply_state=True, per
         )
         if use_model:
             return model_or_fallback(
-                {"kind": "chat", "text": text, "persona": persona},
+                {"kind": "chat", "text": text, "persona": persona, "history": validated_history(context, persona, settings)},
                 settings,
                 fallback,
             )
@@ -1397,7 +1504,7 @@ def response_for_text(text, settings=None, use_model=True, apply_state=True, per
     )
     if use_model:
         return model_or_fallback(
-            {"kind": "chat", "text": text, "persona": persona},
+            {"kind": "chat", "text": text, "persona": persona, "history": validated_history(context, persona, settings)},
             settings,
             fallback,
         )
@@ -1411,6 +1518,7 @@ def response_for_vision(
     settings=None,
     use_model=True,
     persona="mengmeng",
+    context=None,
 ):
     settings = normalize_settings(settings)
     if not settings["allow_vision"]:
@@ -1459,6 +1567,7 @@ def response_for_vision(
             settings,
             fallback,
             persona=persona,
+            history=validated_history(context, persona, settings),
         )
         if modeled is not None:
             return modeled
@@ -1476,6 +1585,7 @@ def response_for_chat_vision(
     settings=None,
     use_model=True,
     persona="mengmeng",
+    context=None,
 ):
     user_text = str(text or "").strip()
     vision_prompt = (
@@ -1490,6 +1600,7 @@ def response_for_chat_vision(
         settings=settings,
         use_model=use_model,
         persona=persona,
+        context=context,
     )
     response["vision_used"] = bool(str(image_base64 or "").strip()) and response.get("expression") != "confused"
     response["vision_prompt"] = vision_prompt
@@ -1820,7 +1931,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
             persona = normalize_persona(payload.get("persona", "mengmeng"))
             print(f"[gateway] chat payload keys={sorted(payload.keys())}", flush=True)
             recovered = False
-            if not chat_text:
+            if not chat_text and "context" not in payload:
                 recovered_text = consume_recent_stt_text()
                 if not recovered_text:
                     import time as _time
@@ -1834,7 +1945,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
                     recovered = True
                     print(f"[gateway] chat input recovered from stt={chat_text!r}", flush=True)
             print(f"[gateway] chat input text={chat_text!r}", flush=True)
-            response = response_for_text(chat_text, payload.get("settings"), persona=persona)
+            response = response_for_text(chat_text, payload.get("settings"), persona=persona, context=payload.get("context"))
             response["chat_input_recovered"] = recovered
             record_debug("chat", payload, response)
             self._json(response)
@@ -1851,7 +1962,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
             )
             if not image_base64:
                 # 无图片，退化为普通chat
-                response = response_for_text(chat_text, payload.get("settings"), persona=persona)
+                response = response_for_text(chat_text, payload.get("settings"), persona=persona, context=payload.get("context"))
                 response["vision_used"] = False
                 response["chat_input_text"] = chat_text
                 record_debug("chat/vision", payload, response)
@@ -1864,6 +1975,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 settings=payload.get("settings"),
                 use_model=True,
                 persona=persona,
+                context=payload.get("context"),
             )
             print(
                 f"[gateway] chat/vision final text={response.get('text', '')!r} "

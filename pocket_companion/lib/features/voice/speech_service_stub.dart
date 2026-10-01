@@ -1,9 +1,14 @@
+import '../../core/network/gateway_config.dart';
 import 'barge_in_config.dart';
 import 'barge_in_result.dart';
 import 'voice_audio_gate_config.dart';
 import 'voice_debug_snapshot.dart';
 
 class SpeechService {
+  SpeechService({this.baseUrl = defaultGatewayBaseUrl});
+
+  final String baseUrl;
+
   VoiceDebugSnapshot get latestDebugSnapshot => VoiceDebugSnapshot();
   VoiceAudioGateConfig get audioGateConfig => const VoiceAudioGateConfig();
 

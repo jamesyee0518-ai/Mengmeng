@@ -26,6 +26,7 @@ class VoiceWakeController {
     BargeInConfig bargeInConfig = const BargeInConfig(),
     WakeDetector? wakeDetector,
     bool Function()? canListen,
+    this.allowAcousticBargeIn = false,
   }) : _speech = speech,
        _config = config,
        _bargeInConfig = bargeInConfig,
@@ -50,6 +51,8 @@ class VoiceWakeController {
     );
   }
 
+  // Energy-only interruption cannot distinguish speech from speaker echo.
+  final bool allowAcousticBargeIn;
   final SpeechService _speech;
   late final WakeDetector _wakeDetector;
   final bool Function()? _canListen;
@@ -59,6 +62,8 @@ class VoiceWakeController {
       StreamController<VoiceDebugSnapshot>.broadcast();
 
   VoiceState _state = VoiceState.idle;
+  VoiceMode _mode = VoiceMode.off;
+  bool _returnToWake = false;
   VoiceDebugSnapshot _latestDebugSnapshot = VoiceDebugSnapshot();
   VoiceWakeConfig _config;
   BargeInConfig _bargeInConfig;
@@ -79,6 +84,7 @@ class VoiceWakeController {
   Stream<VoiceEvent> get events => _events.stream;
   Stream<VoiceDebugSnapshot> get debugSnapshots => _debugSnapshots.stream;
   VoiceState get state => _state;
+  VoiceMode get mode => _mode;
   VoiceDebugSnapshot get latestDebugSnapshot => _latestDebugSnapshot;
   VoiceWakeConfig get config => _config;
   BargeInConfig get bargeInConfig => _bargeInConfig;
@@ -169,11 +175,19 @@ class VoiceWakeController {
     await _startInState(VoiceState.conversation);
   }
 
+  /// Release both microphone owners before recording a reply or playing TTS.
+  Future<void> pauseInput() async {
+    await _wakeDetector.stop();
+    await _speech.stop();
+  }
+
   Future<void> stop() async {
     _runId++;
     _loopToken++;
     _bargeInToken++;
     _bargeInGraceTimer?.cancel();
+    _setState(VoiceState.idle);
+    _updateDebug(_latestDebugSnapshot.copyWith(wakeDetectorStatus: 'stopped'));
     await _wakeDetector.stop();
     await _speech.stop();
     _setState(VoiceState.idle);
@@ -216,7 +230,7 @@ class VoiceWakeController {
       ),
     );
     _setState(VoiceState.speaking);
-    if (_bargeInConfig.enabled) {
+    if (allowAcousticBargeIn && _bargeInConfig.enabled) {
       _bargeInGraceTimer = Timer(_bargeInConfig.postTtsStartGracePeriod, () {
         unawaited(_listenForBargeIn(token, runId));
       });
@@ -228,6 +242,7 @@ class VoiceWakeController {
     _bargeInToken++;
     _bargeInGraceTimer?.cancel();
     _lastTtsEndAt = DateTime.now();
+    _lastConversationActivity = _lastTtsEndAt!;
     _updateDebug(
       _latestDebugSnapshot.copyWith(
         ttsCooldownActive: true,
@@ -236,7 +251,11 @@ class VoiceWakeController {
     );
     if (_state == VoiceState.speaking ||
         _state == VoiceState.bargeInListening) {
-      _setState(VoiceState.conversation);
+      _setState(switch (_mode) {
+        VoiceMode.off => VoiceState.idle,
+        VoiceMode.wake => VoiceState.monitoring,
+        VoiceMode.conversation => VoiceState.conversation,
+      });
     }
   }
 
@@ -260,7 +279,10 @@ class VoiceWakeController {
     if (_disposed) {
       return;
     }
+    final runId = ++_runId;
+    _loopToken++;
     final permissionStatus = await _speech.microphonePermissionStatus();
+    if (_disposed || runId != _runId) return;
     _updateDebug(
       _latestDebugSnapshot.copyWith(
         permissionStatus: permissionStatus,
@@ -272,14 +294,14 @@ class VoiceWakeController {
       _setState(VoiceState.idle);
       return;
     }
-    _runId++;
-    _loopToken++;
-    await _speech.stop();
+    await pauseInput();
+    if (_disposed || runId != _runId) return;
     if (next == VoiceState.monitoring) {
       await _wakeDetector.start();
     }
+    if (_disposed || runId != _runId) return;
+    _returnToWake = next == VoiceState.monitoring;
     _setState(next);
-    final runId = _runId;
     final token = ++_loopToken;
     unawaited(Future<void>.microtask(() => _runLoop(token, runId)));
   }
@@ -289,19 +311,24 @@ class VoiceWakeController {
         _state != VoiceState.idle &&
         token == _loopToken &&
         runId == _runId) {
-      if (_state == VoiceState.conversation &&
-          DateTime.now().difference(_lastConversationActivity) >
-              _config.conversationIdleTimeout) {
-        _emit(const VoiceLogEvent('conversation idle timeout'));
-        _setState(VoiceState.monitoring);
-      }
-
       if (_ttsActive ||
           _state == VoiceState.speaking ||
           _state == VoiceState.bargeInListening ||
           !(_canListen?.call() ?? true)) {
+        _lastConversationActivity = DateTime.now();
         await Future<void>.delayed(_config.monitoringLoopDelay);
         continue;
+      }
+
+      if (_state == VoiceState.conversation &&
+          DateTime.now().difference(_lastConversationActivity) >
+              _config.conversationIdleTimeout) {
+        _emit(const VoiceLogEvent('conversation idle timeout'));
+        if (!_returnToWake) {
+          await stop();
+          return;
+        }
+        _setState(VoiceState.monitoring);
       }
 
       try {
@@ -313,6 +340,7 @@ class VoiceWakeController {
           await Future<void>.delayed(_config.monitoringLoopDelay);
         }
       } catch (error) {
+        if (_disposed || token != _loopToken || runId != _runId) return;
         _emit(VoiceError(error));
         _setState(VoiceState.error);
         await Future<void>.delayed(_config.monitoringLoopDelay);
@@ -330,11 +358,17 @@ class VoiceWakeController {
     _updateDebug(
       _latestDebugSnapshot.copyWith(
         wakeDetectorType: _wakeDetector.type.name,
-        wakeDetectorStatus: 'running',
+        wakeDetectorStatus:
+            _latestDebugSnapshot.wakeDetectorStatus == 'receiving_audio'
+            ? 'receiving_audio'
+            : 'running',
       ),
     );
     await _wakeDetector.detectOnce();
-    _mergeSpeechDebug();
+    if (_wakeDetector is! SherpaOnnxWakeDetector ||
+        _wakeDetector.usingFallback) {
+      _mergeSpeechDebug();
+    }
     if (_disposed ||
         token != _loopToken ||
         runId != _runId ||
@@ -347,6 +381,10 @@ class VoiceWakeController {
   }
 
   Future<void> _listenConversationRound(int token, int runId) async {
+    await _wakeDetector.stop();
+    if (_disposed || token != _loopToken || runId != _runId || _ttsActive) {
+      return;
+    }
     _setState(VoiceState.recording);
     final text = await _speech.listenForUtterance(
       maxDuration: _config.conversationMaxDuration,
@@ -393,7 +431,7 @@ class VoiceWakeController {
           reason: result.reason,
         ),
       );
-      _setState(VoiceState.conversation);
+      _setState(VoiceState.speaking);
       return;
     }
     _emit(
@@ -410,10 +448,20 @@ class VoiceWakeController {
   }
 
   void _handleWakeDetectorEvent(WakeDetectorEvent event) {
-    if (_disposed || _state == VoiceState.idle) {
+    if (_disposed || _mode != VoiceMode.wake || _ttsActive) {
       return;
     }
     switch (event) {
+      case WakeDetectorAudio():
+        _updateDebug(
+          _latestDebugSnapshot.copyWith(
+            durationMs: event.durationMs,
+            avgRms: event.avgRms,
+            maxRms: event.maxRms,
+            recordReason: 'local_kws_audio',
+            wakeDetectorStatus: 'receiving_audio',
+          ),
+        );
       case WakeDetectorDetected():
         _handleWakeDetectorDetected(event);
       case WakeDetectorIgnored():
@@ -560,6 +608,9 @@ class VoiceWakeController {
       return;
     }
     _state = next;
+    if (next == VoiceState.idle) _mode = VoiceMode.off;
+    if (next == VoiceState.monitoring) _mode = VoiceMode.wake;
+    if (next == VoiceState.conversation) _mode = VoiceMode.conversation;
     _updateDebug(
       _latestDebugSnapshot.copyWith(
         voiceState: next,

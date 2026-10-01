@@ -1,3 +1,6 @@
+import 'package:pocket_companion/core/logging/debug_log_store.dart';
+import 'package:pocket_companion/features/voice/voice_settings_store.dart';
+import 'package:pocket_companion/features/chat/conversation_context.dart';
 import 'dart:async';
 
 import 'package:flutter/material.dart';
@@ -15,7 +18,6 @@ import 'package:pocket_companion/features/vision/vision_service.dart';
 import 'package:pocket_companion/features/voice/speech_service.dart';
 import 'package:pocket_companion/features/voice/tts_service.dart';
 
-
 /// 沉浸式模式：触摸脸区唤出顶部状态条与底部输入区
 Future<void> _revealComposer(WidgetTester tester) async {
   await tester.tap(find.byKey(const ValueKey('robotFaceArea')));
@@ -24,6 +26,204 @@ Future<void> _revealComposer(WidgetTester tester) async {
 }
 
 void main() {
+  testWidgets(
+    'default wake resumes after background and diagnostics fit landscape',
+    (tester) async {
+      await tester.binding.setSurfaceSize(const Size(780, 360));
+      addTearDown(() => tester.binding.setSurfaceSize(null));
+      final speech = _FakeSpeechService();
+      await tester.pumpWidget(_testApp(speech: speech, autoStartWake: true));
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 50));
+      tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.inactive);
+      await tester.pump();
+      final count = speech.listenOnceCalls;
+      tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.resumed);
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 50));
+      expect(speech.listenOnceCalls, greaterThan(count));
+      await tester.tap(find.byKey(const ValueKey('noticeButton')));
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 300));
+      await tester.tap(find.text('语音诊断'));
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 300));
+      expect(
+        find.byKey(const ValueKey('voiceDiagnosticsScroll')),
+        findsOneWidget,
+      );
+      expect(tester.takeException(), isNull);
+      await tester.drag(
+        find.byKey(const ValueKey('voiceDiagnosticsScroll')),
+        const Offset(0, -250),
+      );
+      await tester.pump();
+      expect(tester.takeException(), isNull);
+      await tester.pumpWidget(const SizedBox());
+      await tester.pump(const Duration(seconds: 1));
+    },
+  );
+
+  testWidgets('wake starts by default and manual stop survives resume', (
+    tester,
+  ) async {
+    final speech = _FakeSpeechService();
+    await tester.pumpWidget(_testApp(speech: speech, autoStartWake: true));
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 50));
+    expect(speech.listenOnceCalls, greaterThan(0));
+    await _openControls(tester);
+    expect(find.text('关闭唤醒'), findsOneWidget);
+    await tester.tap(find.byKey(const ValueKey('toggleWakeListening')));
+    await tester.pump();
+    final count = speech.listenOnceCalls;
+    tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.inactive);
+    await tester.pump();
+    tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.resumed);
+    await tester.pump(const Duration(seconds: 1));
+    expect(speech.listenOnceCalls, count);
+    await tester.pumpWidget(const SizedBox());
+  });
+
+  testWidgets(
+    'errors stay behind persistent red dot and reading clears unread',
+    (tester) async {
+      final logs = DebugLogStore();
+      await tester.pumpWidget(_testApp(logs: logs));
+      await tester.pump();
+      logs.warning('speech', '测试错误提示');
+      await tester.pump();
+      expect(find.text('测试错误提示'), findsNothing);
+      expect(find.byType(SnackBar), findsNothing);
+      expect(find.byKey(const ValueKey('unreadNoticeDot')), findsOneWidget);
+      expect(find.byKey(const ValueKey('expressionLabel')), findsNothing);
+      await tester.tap(find.byKey(const ValueKey('noticeButton')));
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 300));
+      expect(find.text('测试错误提示'), findsOneWidget);
+      expect(find.byKey(const ValueKey('unreadNoticeDot')), findsNothing);
+      await tester.pumpWidget(const SizedBox());
+    },
+  );
+
+  testWidgets(
+    'page carries prior turn and clears it after leaving foreground',
+    (tester) async {
+      final gateway = _ContextGatewayClient();
+      await tester.pumpWidget(_testApp(gateway: gateway));
+      await _revealComposer(tester);
+      Future<void> send(String text) async {
+        await tester.enterText(find.byKey(const ValueKey('chatInput')), text);
+        await tester.tap(find.byKey(const ValueKey('sendChat')));
+        await tester.pump();
+        await tester.pump();
+      }
+
+      await send('我叫小明');
+      await send('我叫什么');
+      expect(gateway.contexts[0].history, isEmpty);
+      expect(gateway.contexts[1].history.first['content'], '我叫小明');
+      tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.inactive);
+      await tester.pump();
+      tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.resumed);
+      await tester.pump();
+      await send('新的对话');
+      expect(gateway.contexts.last.history, isEmpty);
+      expect(
+        gateway.contexts.last.sessionId,
+        isNot(gateway.contexts.first.sessionId),
+      );
+      await tester.pumpWidget(const SizedBox());
+    },
+  );
+
+  testWidgets('backgrounding discards an outstanding reply', (tester) async {
+    final gateway = _PendingGatewayClient();
+    final tts = _FakeTtsService();
+    await tester.pumpWidget(_testApp(gateway: gateway, tts: tts));
+    await _revealComposer(tester);
+    await tester.enterText(find.byKey(const ValueKey('chatInput')), 'test');
+    await tester.tap(find.byKey(const ValueKey('sendChat')));
+    await tester.pump();
+    tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.inactive);
+    await tester.pump();
+    gateway.reply.complete(
+      RobotResponse.fromMap({
+        'text': 'late reply',
+        'expression': 'neutral',
+        'should_speak': true,
+      }),
+    );
+    await tester.pump();
+    await tester.pump();
+    expect(tts.spokenTexts, isEmpty);
+    tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.resumed);
+    await tester.pumpWidget(const SizedBox());
+  });
+
+  testWidgets('revealing controls does not trigger a gateway event', (
+    tester,
+  ) async {
+    final gateway = _PendingGatewayClient();
+    await tester.pumpWidget(_testApp(gateway: gateway));
+    await _revealComposer(tester);
+    expect(gateway.eventCalls, 0);
+  });
+
+  testWidgets(
+    'open controls unlock all five actions when a request completes',
+    (tester) async {
+      final gateway = _PendingGatewayClient();
+      await tester.pumpWidget(_testApp(gateway: gateway));
+      await _revealComposer(tester);
+      await tester.enterText(find.byKey(const ValueKey('chatInput')), 'test');
+      await tester.tap(find.byKey(const ValueKey('sendChat')));
+      await tester.pump();
+      await tester.tap(find.byKey(const ValueKey('openControlPanel')));
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 300));
+      final keys = [
+        'toggleWakeListening',
+        'toggleVoiceConversation',
+        'panelListenVoice',
+        'panelLook',
+        'toggleVisionMonitoring',
+      ];
+      FilledButton button(String key) => tester.widget<FilledButton>(
+        find.descendant(
+          of: find.byKey(ValueKey(key)),
+          matching: find.byType(FilledButton),
+        ),
+      );
+      for (final key in keys) {
+        expect(button(key).onPressed, isNull);
+      }
+      gateway.reply.complete(
+        RobotResponse.fromMap({
+          'text': 'done',
+          'expression': 'neutral',
+          'should_speak': false,
+        }),
+      );
+      await tester.pump();
+      await tester.pump();
+      await tester.pump();
+      for (final key in keys) {
+        expect(button(key).onPressed, isNotNull, reason: key);
+      }
+      await tester.tap(find.byKey(const ValueKey('toggleVisionMonitoring')));
+      await tester.pump();
+      await tester.pump();
+      expect(find.text('关闭守望'), findsOneWidget);
+      await tester.tap(find.byKey(const ValueKey('toggleVisionMonitoring')));
+      await tester.pump();
+      await tester.pump();
+      expect(find.text('视觉守望'), findsOneWidget);
+      await tester.pumpWidget(const SizedBox());
+      await tester.pump(const Duration(seconds: 11));
+    },
+  );
+
   testWidgets('FacePage smoke builds robot shell', (tester) async {
     await tester.pumpWidget(_testApp());
 
@@ -108,7 +308,9 @@ void main() {
     expect(find.byKey(const ValueKey('checkLightImpact')), findsOneWidget);
   });
 
-  testWidgets('gateway unavailable blocks wake listening', (tester) async {
+  testWidgets('gateway unavailable does not block wake startup', (
+    tester,
+  ) async {
     final speech = _FakeSpeechService();
     await tester.pumpWidget(
       _testApp(
@@ -128,11 +330,13 @@ void main() {
     await tester.pump();
     await tester.pump(const Duration(milliseconds: 20));
 
-    expect(speech.listenOnceCalls, 0);
-    expect(find.byType(SnackBar), findsOneWidget);
+    expect(speech.listenOnceCalls, greaterThan(0));
+    expect(find.byType(SnackBar), findsNothing);
+    await tester.pumpWidget(const SizedBox());
+    await tester.pump(const Duration(seconds: 1));
   });
 
-  testWidgets('stt unavailable blocks wake listening', (tester) async {
+  testWidgets('stt health does not block wake startup', (tester) async {
     final speech = _FakeSpeechService();
     await tester.pumpWidget(
       _testApp(
@@ -153,8 +357,10 @@ void main() {
     await tester.pump();
     await tester.pump(const Duration(milliseconds: 20));
 
-    expect(speech.listenOnceCalls, 0);
-    expect(find.byType(SnackBar), findsOneWidget);
+    expect(speech.listenOnceCalls, greaterThan(0));
+    expect(find.byType(SnackBar), findsNothing);
+    await tester.pumpWidget(const SizedBox());
+    await tester.pump(const Duration(seconds: 1));
   });
 }
 
@@ -166,14 +372,20 @@ Future<void> _openControls(WidgetTester tester) async {
 }
 
 Widget _testApp({
+  AiGatewayClient? gateway,
   DeviceEventService? deviceEvents,
   TtsService? tts,
   SpeechService? speech,
   GatewayHealthService? gatewayHealthService,
+  bool autoStartWake = false,
+  DebugLogStore? logs,
 }) {
   return MaterialApp(
     home: FacePage(
-      gateway: _FakeGatewayClient(),
+      autoStartWake: autoStartWake,
+      logs: logs,
+      voiceSettingsStore: MemoryVoiceSettingsStore(),
+      gateway: gateway ?? _FakeGatewayClient(),
       tts: tts ?? _FakeTtsService(),
       speech: speech ?? _FakeSpeechService(),
       vision: _FakeVisionService(),
@@ -308,6 +520,7 @@ class _FakeGatewayClient extends AiGatewayClient {
     String text, {
     CompanionSettings? settings,
     String? persona,
+    ConversationContext? context,
   }) async {
     return RobotResponse.fromMap({
       'text': 'chat ok',
@@ -333,4 +546,53 @@ Map<String, Object> _robotState(String mood, int energy) {
     'sleepiness': 24,
     'last_interaction_at': '2026-06-06T00:00:00Z',
   };
+}
+
+class _PendingGatewayClient extends _FakeGatewayClient {
+  final reply = Completer<RobotResponse>();
+  int eventCalls = 0;
+
+  @override
+  Future<RobotResponse> chat(
+    String text, {
+    CompanionSettings? settings,
+    String? persona,
+    ConversationContext? context,
+  }) => reply.future;
+
+  @override
+  Future<RobotResponse> event(
+    String type, {
+    CompanionSettings? settings,
+    DeviceEvent? deviceEvent,
+    String? persona,
+    String? source,
+  }) {
+    eventCalls++;
+    return super.event(
+      type,
+      settings: settings,
+      deviceEvent: deviceEvent,
+      persona: persona,
+      source: source,
+    );
+  }
+}
+
+class _ContextGatewayClient extends _FakeGatewayClient {
+  final contexts = <ConversationContext>[];
+  @override
+  Future<RobotResponse> chat(
+    String text, {
+    CompanionSettings? settings,
+    String? persona,
+    ConversationContext? context,
+  }) async {
+    contexts.add(context!);
+    return RobotResponse.fromMap({
+      'text': '你好小明',
+      'model_provider': 'lmstudio',
+      'should_speak': false,
+    });
+  }
 }

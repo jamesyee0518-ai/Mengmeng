@@ -13,6 +13,17 @@ void main() {
     expect(result.score, greaterThanOrEqualTo(0.85));
   });
 
+  for (final word in ['小易', '你好小易', '小易小易']) {
+    test('$word wakes the existing persona without leftover command', () {
+      final result = matcher.match(word);
+      expect(result?.persona, 'mengmeng');
+      expect(result?.wakeWord, word);
+      expect(result?.command, '');
+      expect(result?.canWakeDirectly, isTrue);
+      expect(matcher.match('$word，帮我看看这个')?.command, '帮我看看这个');
+    });
+  }
+
   test('fuzzy wake word alone is ignored', () {
     expect(matcher.match('妹妹'), isNull);
     expect(matcher.match('么么'), isNull);

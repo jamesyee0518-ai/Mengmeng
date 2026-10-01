@@ -86,7 +86,11 @@ class MainActivity : FlutterActivity() {
             "pocket_companion/sherpa_wake_control"
         ).setMethodCallHandler { call, result ->
             when (call.method) {
-                "start" -> result.success(startSherpaAudio())
+                "start" -> try {
+                    result.success(startSherpaAudio())
+                } catch (error: Exception) {
+                    result.error("sherpa_audio_start_failed", error.message, null)
+                }
                 "stop" -> { stopSherpaAudio(); result.success(null) }
                 "status" -> result.success(mapOf("running" to sherpaAudioRunning.get()))
                 else -> result.notImplemented()
@@ -127,22 +131,29 @@ class MainActivity : FlutterActivity() {
         if (recordingInProgress.get()) return mapOf("started" to false, "reason" to "recording_busy")
         if (!sherpaAudioRunning.compareAndSet(false, true)) return mapOf("started" to true)
         sherpaAudioThread = Thread {
-            val sampleRate = 16000
-            val minSize = AudioRecord.getMinBufferSize(
-                sampleRate, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT
-            )
-            val audioRecord = AudioRecord(
-                MediaRecorder.AudioSource.VOICE_RECOGNITION,
-                sampleRate,
-                AudioFormat.CHANNEL_IN_MONO,
-                AudioFormat.ENCODING_PCM_16BIT,
-                maxOf(minSize, 3200)
-            )
-            val samples = ShortArray(1600)
+            var ownedRecorder: AudioRecord? = null
             try {
+                val sampleRate = 16000
+                val minSize = AudioRecord.getMinBufferSize(
+                    sampleRate, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT
+                )
+                check(minSize > 0) { "Unsupported wake recording format: $minSize" }
+                val audioRecord = AudioRecord(
+                    MediaRecorder.AudioSource.VOICE_RECOGNITION,
+                    sampleRate,
+                    AudioFormat.CHANNEL_IN_MONO,
+                    AudioFormat.ENCODING_PCM_16BIT,
+                    maxOf(minSize, 3200)
+                )
+                ownedRecorder = audioRecord
+                val samples = ShortArray(1600)
+                check(audioRecord.state == AudioRecord.STATE_INITIALIZED) { "Wake recorder is not initialized" }
                 audioRecord.startRecording()
-                while (sherpaAudioRunning.get() && !recordingInProgress.get()) {
+                check(audioRecord.recordingState == AudioRecord.RECORDSTATE_RECORDING) { "Wake recorder did not start" }
+                while (sherpaAudioRunning.get()) {
+                    check(!recordingInProgress.get()) { "Wake microphone interrupted by another recorder" }
                     val count = audioRecord.read(samples, 0, samples.size)
+                    check(count >= 0) { "Wake audio read failed: $count" }
                     if (count > 0) {
                         val bytes = ByteArray(count * 2)
                         for (i in 0 until count) {
@@ -157,8 +168,8 @@ class MainActivity : FlutterActivity() {
                     sherpaAudioSink?.error("sherpa_audio_failed", error.message, null)
                 }
             } finally {
-                try { audioRecord.stop() } catch (_: Exception) {}
-                audioRecord.release()
+                try { ownedRecorder?.stop() } catch (_: Exception) {}
+                ownedRecorder?.release()
                 sherpaAudioRunning.set(false)
             }
         }.also { it.start() }

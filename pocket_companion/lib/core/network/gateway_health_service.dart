@@ -1,3 +1,4 @@
+import 'gateway_config.dart';
 import 'dart:async';
 import 'dart:convert';
 
@@ -6,10 +7,7 @@ import 'robot_http_transport.dart';
 
 class GatewayHealthService {
   GatewayHealthService({
-    this.baseUrl = const String.fromEnvironment(
-      'AI_GATEWAY_BASE_URL',
-      defaultValue: 'http://192.168.1.111:8787',
-    ),
+    this.baseUrl = defaultGatewayBaseUrl,
     RobotHttpTransport? transport,
   }) : _transport = transport ?? RobotHttpTransport();
 
@@ -17,7 +15,7 @@ class GatewayHealthService {
   final RobotHttpTransport _transport;
 
   Future<GatewayHealth> checkHealth({
-    Duration timeout = const Duration(seconds: 2),
+    Duration timeout = gatewayHealthTimeout,
   }) async {
     final checkedAt = DateTime.now();
     try {

@@ -11,3 +11,6 @@ enum VoiceState {
   bargeInListening,
   error,
 }
+
+/// User-visible session mode, independent of recording and playback phases.
+enum VoiceMode { off, wake, conversation }

@@ -5,6 +5,13 @@ import 'package:pocket_companion/core/network/gateway_health_service.dart';
 import 'package:pocket_companion/core/network/robot_http_transport.dart';
 
 void main() {
+  test('public health response after four seconds is not marked unavailable', () async {
+    final service = GatewayHealthService(transport: _SlowHealthyTransport());
+    final health = await service.checkHealth();
+    expect(health.gateway.ok, isTrue);
+    expect(health.stt.ok, isTrue);
+  });
+
   test('checkHealth returns parsed health', () async {
     final service = GatewayHealthService(
       transport: _HealthTransport(
@@ -59,4 +66,14 @@ class _HealthTransport implements RobotHttpTransport {
   }) {
     throw UnimplementedError();
   }
+}
+
+class _SlowHealthyTransport extends _HealthTransport {
+  @override
+  Future<RobotHttpResponse> get(Uri uri, {
+    Duration timeout = const Duration(seconds: 3),
+  }) => Future.delayed(const Duration(seconds: 4), () => const RobotHttpResponse(
+    statusCode: 200,
+    body: '{"ok":true,"gateway":{"ok":true},"stt":{"ok":true},"llm":{"ok":true},"tts":{"ok":true}}',
+  )).timeout(timeout);
 }

@@ -1,9 +1,10 @@
 import 'dart:async';
 import 'dart:io' show Platform;
-import 'dart:typed_data';
 import 'dart:ui' show Size;
 
 import 'package:camera/camera.dart';
+import 'package:flutter/services.dart' show DeviceOrientation;
+import 'package:flutter/foundation.dart' show debugPrint, visibleForTesting;
 import 'package:google_mlkit_face_detection/google_mlkit_face_detection.dart';
 
 import 'face_observation.dart';
@@ -35,8 +36,11 @@ class FaceStreamService {
 
   CameraController? _camera;
   late final FaceDetector _detector;
-  InputImageRotation _rotation = InputImageRotation.rotation0deg;
+  Future<void> _operations = Future<void>.value();
+  int _generation = 0;
+  Completer<void>? _processingDone;
   int _lastProcessAtMs = 0;
+  int _lastDiagnosticAtMs = 0;
   bool _processing = false;
   bool _running = false;
   FaceObservation? _latest;
@@ -48,7 +52,15 @@ class FaceStreamService {
   Stream<FaceObservation> get observations => _observationsController.stream;
 
   /// 启动帧流。返回 null 表示成功，否则返回错误说明。
-  Future<String?> start() async {
+  Future<String?> start() {
+    final generation = _generation;
+    final operation = _operations.then((_) => _start(generation));
+    _operations = operation.then<void>((_) {}, onError: (Object _) {});
+    return operation;
+  }
+
+  Future<String?> _start(int generation) async {
+    if (generation != _generation) return '检测启动已取消';
     if (!isSupported) {
       return '当前平台不支持本地人脸流检测';
     }
@@ -64,28 +76,39 @@ class FaceStreamService {
         (item) => item.lensDirection == CameraLensDirection.front,
         orElse: () => cameras.first,
       );
-      _rotation = _rotationForSensorOrientation(camera.sensorOrientation);
       final controller = CameraController(
         camera,
-        ResolutionPreset.low,
+        ResolutionPreset.medium,
         enableAudio: false,
         imageFormatGroup: ImageFormatGroup.nv21,
       );
-      await controller.initialize();
-      await _camera?.dispose();
       _camera = controller;
+      await controller.initialize();
+      if (generation != _generation) return '检测启动已取消';
+      _latest = null;
+      _lastProcessAtMs = 0;
       _running = true;
       await controller.startImageStream(_onFrame);
       return null;
     } catch (error) {
       _running = false;
+      await _camera?.dispose();
+      _camera = null;
       return '相机启动失败: $error';
     }
   }
 
   /// 释放相机（帧流停止，检测结果流保持可复用）。
-  Future<void> release() async {
+  Future<void> release() {
+    _generation++;
     _running = false;
+    _latest = null;
+    final operation = _operations.then((_) => _release());
+    _operations = operation.then<void>((_) {}, onError: (Object _) {});
+    return operation;
+  }
+
+  Future<void> _release() async {
     final camera = _camera;
     _camera = null;
     if (camera == null) {
@@ -95,6 +118,7 @@ class FaceStreamService {
       await camera.stopImageStream();
     } catch (_) {}
     await camera.dispose();
+    await _processingDone?.future;
   }
 
   Future<void> dispose() async {
@@ -113,41 +137,77 @@ class FaceStreamService {
     }
     _lastProcessAtMs = nowMs;
     _processing = true;
+    _processingDone = Completer<void>();
+    final generation = _generation;
+    final camera = _camera!;
+    final rotation = rotationForCamera(
+      camera.description.sensorOrientation,
+      camera.description.lensDirection,
+      camera.value.deviceOrientation,
+    );
     try {
-      final input = _toInputImage(image);
+      final logFrame = nowMs - _lastDiagnosticAtMs >= 3000;
+      if (logFrame) {
+        _lastDiagnosticAtMs = nowMs;
+        debugPrint(
+          '[face-stream] ${image.width}x${image.height} '
+          'rotation=${rotation.rawValue} orientation=${camera.value.deviceOrientation.name} '
+          'format=${image.format.group.name} planes=${image.planes.length} '
+          'bytes=${image.planes.map((p) => p.bytes.length).join(",")}',
+        );
+      }
+      final input = inputImageFromCameraImage(image, rotation);
       if (input == null) {
+        if (logFrame) debugPrint("[face-stream] unsupported frame layout");
         return;
       }
       final faces = await _detector.processImage(input);
-      _emit(image, faces, DateTime.now());
-    } catch (_) {
-      // 单帧失败直接丢弃，等待下一帧。
+      if (_running && generation == _generation) {
+        _emit(image, faces, DateTime.now(), rotation);
+      }
+    } catch (error) {
+      debugPrint("[face-stream] detection failed: $error");
     } finally {
       _processing = false;
+      _processingDone?.complete();
+      _processingDone = null;
     }
   }
 
-  InputImage? _toInputImage(CameraImage image) {
-    // imageFormatGroup.nv21 下 Android 返回 Y 平面 + VU 交错平面，
-    // 顺序拼接即为 NV21 缓冲。
-    if (image.planes.length < 2) {
+  @visibleForTesting
+  static InputImage? inputImageFromCameraImage(
+    CameraImage image,
+    InputImageRotation rotation,
+  ) {
+    // CameraX 已将 YUV 平面转换为单个紧密排列的 NV21 缓冲。
+    if (image.format.group != ImageFormatGroup.nv21 ||
+        image.planes.length != 1 ||
+        image.width <= 0 ||
+        image.height <= 0) {
       return null;
     }
-    final builder = BytesBuilder(copy: false)
-      ..add(image.planes[0].bytes)
-      ..add(image.planes[1].bytes);
+    final plane = image.planes.single;
+    if (plane.bytesPerRow != image.width ||
+        plane.bytes.length != image.width * image.height * 3 ~/ 2) {
+      return null;
+    }
     return InputImage.fromBytes(
-      bytes: builder.takeBytes(),
+      bytes: plane.bytes,
       metadata: InputImageMetadata(
         size: Size(image.width.toDouble(), image.height.toDouble()),
-        rotation: _rotation,
+        rotation: rotation,
         format: InputImageFormat.nv21,
-        bytesPerRow: image.planes[0].bytesPerRow,
+        bytesPerRow: plane.bytesPerRow,
       ),
     );
   }
 
-  void _emit(CameraImage image, List<Face> faces, DateTime timestamp) {
+  void _emit(
+    CameraImage image,
+    List<Face> faces,
+    DateTime timestamp,
+    InputImageRotation rotation,
+  ) {
     Face? largest;
     var largestArea = 0.0;
     for (final face in faces) {
@@ -159,8 +219,9 @@ class FaceStreamService {
       }
     }
     // 旋转 90/270 时检测坐标系宽高与原始帧互换。
-    final rotated = _rotation == InputImageRotation.rotation90deg ||
-        _rotation == InputImageRotation.rotation270deg;
+    final rotated =
+        rotation == InputImageRotation.rotation90deg ||
+        rotation == InputImageRotation.rotation270deg;
     final frameWidth = (rotated ? image.height : image.width).toDouble();
     final frameHeight = (rotated ? image.width : image.height).toDouble();
     FaceObservation observation;
@@ -187,7 +248,23 @@ class FaceStreamService {
     }
   }
 
-  static InputImageRotation _rotationForSensorOrientation(int degrees) {
+  @visibleForTesting
+  static InputImageRotation rotationForCamera(
+    int sensorOrientation,
+    CameraLensDirection lens,
+    DeviceOrientation orientation,
+  ) {
+    final compensation = switch (orientation) {
+      DeviceOrientation.portraitUp => 0,
+      DeviceOrientation.landscapeLeft => 90,
+      DeviceOrientation.portraitDown => 180,
+      DeviceOrientation.landscapeRight => 270,
+    };
+    final degrees =
+        (sensorOrientation +
+            (lens == CameraLensDirection.front ? compensation : -compensation) +
+            360) %
+        360;
     return switch (degrees) {
       90 => InputImageRotation.rotation90deg,
       180 => InputImageRotation.rotation180deg,

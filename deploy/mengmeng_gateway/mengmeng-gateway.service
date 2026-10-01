@@ -1,0 +1,14 @@
+[Unit]
+Description=Mengmeng AI gateway (MiniMax and local speech)
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/video_dub_pipeline/services/mengmeng_gateway
+ExecStart=/usr/bin/python3 -u %h/video_dub_pipeline/services/mengmeng_gateway/start.py
+Restart=always
+RestartSec=3
+UMask=0077
+
+[Install]
+WantedBy=default.target

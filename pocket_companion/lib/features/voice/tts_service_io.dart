@@ -5,15 +5,33 @@ import 'dart:typed_data';
 
 import 'package:audioplayers/audioplayers.dart';
 import 'package:flutter_tts/flutter_tts.dart';
+import 'package:flutter/foundation.dart' show visibleForTesting;
+import 'tts_chunks.dart';
 
 /// TTS：网络合成优先（网关 /tts -> 语音服务器 edge-tts，音色远好于系统 TTS），
 /// 网络不可用时自动回退手机系统合成（flutter_tts）。
 class TtsService {
-  TtsService({FlutterTts? tts, String? networkBaseUrl})
-    : _tts = tts ?? FlutterTts(),
-      _networkBaseUrl = networkBaseUrl;
+  TtsService({
+    FlutterTts? tts,
+    String? networkBaseUrl,
+    @visibleForTesting AudioPlayer? player,
+    @visibleForTesting Future<Uint8List?> Function(String)? synthesize,
+  }) : _tts = tts ?? FlutterTts(),
+       _networkBaseUrl = networkBaseUrl,
+       _netPlayer = player,
+       _synthesize = synthesize;
 
   final FlutterTts _tts;
+  final Future<Uint8List?> Function(String)? _synthesize;
+  int _generation = 0;
+  Future<void> _playerOperations = Future<void>.value();
+
+  Future<void> _playerOperation(Future<void> Function() action) {
+    final operation = _playerOperations.then((_) => action());
+    _playerOperations = operation.catchError((Object _) {});
+    return operation;
+  }
+
   final String? _networkBaseUrl;
   final HttpClient _httpClient = HttpClient()
     ..connectionTimeout = const Duration(seconds: 8);
@@ -30,33 +48,42 @@ class TtsService {
     double volume = 0.75,
     String persona = 'mengmeng',
   }) async {
-    await stop();
-    if (text.trim().isEmpty) {
-      return;
-    }
-    if (_networkBaseUrl != null) {
-      final spoken = await _speakViaNetwork(
-        text,
-        style: style,
-        speed: speed,
-        persona: persona,
-      );
-      if (spoken) {
-        return;
+    final generation = ++_generation;
+    await _stopPlayback();
+    for (final chunk in ttsChunks(text)) {
+      if (generation != _generation) return;
+      var spoken = false;
+      if (_networkBaseUrl != null || _synthesize != null) {
+        final bytes = _synthesize != null
+            ? await _synthesize(chunk)
+            : await _synthesizeNetwork(
+                chunk,
+                style: style,
+                speed: speed,
+                persona: persona,
+              );
+        if (generation != _generation) return;
+        if (bytes != null && bytes.isNotEmpty) {
+          spoken = await _playNetworkAudio(bytes, generation, volume);
+        }
+      }
+      if (generation != _generation) return;
+      if (!spoken) {
+        await _speakViaSystem(
+          chunk,
+          style: style,
+          speed: speed,
+          pitch: pitch,
+          volume: volume,
+          generation: generation,
+        );
       }
     }
-    await _speakViaSystem(
-      text,
-      style: style,
-      speed: speed,
-      pitch: pitch,
-      volume: volume,
-    );
   }
 
   // ------------------------------------------------------------ 网络合成
 
-  Future<bool> _speakViaNetwork(
+  Future<Uint8List?> _synthesizeNetwork(
     String text, {
     required String style,
     required double speed,
@@ -76,48 +103,72 @@ class TtsService {
           'speed': speed,
         }),
       );
-      final response = await request
-          .close()
-          .timeout(const Duration(seconds: 25));
+      final response = await request.close().timeout(
+        const Duration(seconds: 25),
+      );
       if (response.statusCode != 200) {
-        return false;
+        return null;
       }
       final builder = BytesBuilder(copy: false);
-      await for (final chunk in response) {
-        builder.add(chunk);
-      }
+      await response.forEach(builder.add).timeout(const Duration(seconds: 30));
       final bytes = Uint8List.fromList(builder.takeBytes());
       if (bytes.isEmpty) {
-        return false;
+        return null;
       }
-      return _playNetworkAudio(bytes);
+      return bytes;
     } catch (_) {
-      return false;
+      return null;
     }
   }
 
-  Future<bool> _playNetworkAudio(Uint8List bytes) async {
+  Future<bool> _playNetworkAudio(
+    Uint8List bytes,
+    int generation,
+    double volume,
+  ) async {
+    if (generation != _generation) return true;
     final player = _netPlayer ??= AudioPlayer();
     final completer = Completer<void>();
     _activeCompleter = completer;
     await _netCompleteSub?.cancel();
-    _netCompleteSub = player.onPlayerComplete.listen((_) {
-      if (!completer.isCompleted) {
-        completer.complete();
-      }
+    if (generation != _generation) return true;
+    final subscription = player.onPlayerComplete.listen(
+      (_) {
+        if (!completer.isCompleted) completer.complete();
+      },
+      onError: (Object error, StackTrace stack) {
+        if (!completer.isCompleted) completer.completeError(error, stack);
+      },
+    );
+    _netCompleteSub = subscription;
+    // Install the handler before play; timeout is an explicit failure, never
+    // a successful completion that reopens the microphone over ongoing audio.
+    final finished = completer.future.timeout(const Duration(minutes: 3));
+    final completionError = <Object>[];
+    final observed = finished.catchError((Object error) {
+      completionError.add(error);
     });
     try {
-      await player.play(BytesSource(bytes));
-    } catch (_) {
-      return false;
+      await _playerOperation(() async {
+        if (generation == _generation) {
+          await player.play(BytesSource(bytes), volume: volume.clamp(0.0, 1.0));
+        }
+      });
+      if (generation != _generation) return true;
+      await observed;
+      if (completionError.isNotEmpty) throw completionError.first;
+      return true;
+    } finally {
+      if (!completer.isCompleted) completer.complete();
+      await subscription.cancel();
+      if (identical(_netCompleteSub, subscription)) _netCompleteSub = null;
+      if (generation == _generation) {
+        await _playerOperation(() async {
+          if (generation == _generation) await player.stop();
+        });
+        if (identical(_activeCompleter, completer)) _activeCompleter = null;
+      }
     }
-    // mp3 24kbps 估算：字节*8/24 毫秒，留 3 秒余量，上限 90 秒
-    final estimatedMs = 3000 + (bytes.lengthInBytes * 8 / 24).round();
-    await completer.future.timeout(
-      Duration(milliseconds: estimatedMs.clamp(3000, 90000)),
-      onTimeout: () {},
-    );
-    return true;
   }
 
   // ------------------------------------------------------------ 系统合成
@@ -128,15 +179,18 @@ class TtsService {
     required double speed,
     required double pitch,
     required double volume,
+    required int generation,
   }) async {
     final completer = Completer<void>();
     _activeCompleter = completer;
+    Object? playbackError;
     _tts.setCompletionHandler(() {
       if (!completer.isCompleted) {
         completer.complete();
       }
     });
-    _tts.setErrorHandler((_) {
+    _tts.setErrorHandler((error) {
+      playbackError = error;
       if (!completer.isCompleted) {
         completer.complete();
       }
@@ -147,17 +201,25 @@ class TtsService {
       }
     });
 
+    if (generation != _generation) return;
     await _tts.setLanguage('zh-CN');
     await _applyVoiceStyle(style);
     await _tts.setSpeechRate(speed.clamp(0.4, 1.0));
     await _tts.setPitch(pitch.clamp(0.5, 1.5));
     await _tts.setVolume(volume.clamp(0.0, 1.0));
     await _tts.awaitSpeakCompletion(true);
-    await _tts.speak(text);
-    await completer.future.timeout(
-      Duration(milliseconds: 900 + text.runes.length * 130),
-      onTimeout: () {},
-    );
+    if (generation != _generation) return;
+    try {
+      await _tts.speak(text).timeout(const Duration(minutes: 3));
+      if (generation != _generation) return;
+      await completer.future.timeout(const Duration(minutes: 3));
+      if (playbackError != null) throw StateError('系统播报失败：$playbackError');
+    } finally {
+      if (generation == _generation) {
+        await _tts.stop();
+        if (identical(_activeCompleter, completer)) _activeCompleter = null;
+      }
+    }
   }
 
   Future<void> _applyVoiceStyle(String style) async {
@@ -193,24 +255,28 @@ class TtsService {
         (marker) => normalized.contains(marker.toLowerCase()),
       );
       if (isChinese && matches) {
-        return voice.map(
-          (key, value) => MapEntry('$key', '$value'),
-        );
+        return voice.map((key, value) => MapEntry('$key', '$value'));
       }
     }
     return null;
   }
 
   Future<void> stop() async {
+    _generation++;
+    await _stopPlayback();
+  }
+
+  Future<void> _stopPlayback() async {
+    final active = _activeCompleter;
+    _activeCompleter = null;
+    if (active != null && !active.isCompleted) active.complete();
     try {
-      await _netPlayer?.stop();
+      await _playerOperation(() async {
+        await _netPlayer?.stop();
+      });
     } catch (_) {}
     try {
       await _tts.stop();
     } catch (_) {}
-    if (_activeCompleter?.isCompleted == false) {
-      _activeCompleter?.complete();
-    }
-    _activeCompleter = null;
   }
 }

@@ -1,3 +1,4 @@
+import '../../core/network/gateway_config.dart';
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
@@ -13,16 +14,15 @@ import 'voice_audio_gate_config.dart';
 import 'voice_debug_snapshot.dart';
 
 class SpeechService {
-  SpeechService({stt.SpeechToText? speech})
-    : _speech = speech ?? stt.SpeechToText();
+  SpeechService({
+    stt.SpeechToText? speech,
+    this.baseUrl = defaultGatewayBaseUrl,
+  }) : _speech = speech ?? stt.SpeechToText();
 
   static const MethodChannel _capabilities = MethodChannel(
     'pocket_companion/device_capabilities',
   );
-  static const String _gatewayBaseUrl = String.fromEnvironment(
-    'AI_GATEWAY_BASE_URL',
-    defaultValue: 'http://192.168.1.111:8787',
-  );
+  final String baseUrl;
 
   final stt.SpeechToText _speech;
   VoiceAudioGateConfig _audioGateConfig = const VoiceAudioGateConfig();
@@ -248,7 +248,9 @@ class SpeechService {
       unawaited(file.delete().catchError((_) => file));
       final client = HttpClient();
       try {
-        final uri = Uri.parse('$_gatewayBaseUrl/stt');
+        final uri = Uri.parse(
+          '${baseUrl.replaceFirst(RegExp(r'/+$'), '')}/stt',
+        );
         final request = await client
             .postUrl(uri)
             .timeout(const Duration(seconds: 5));

@@ -21,9 +21,9 @@ class VisionService {
         ResolutionPreset.low,
         enableAudio: false,
       );
-      await controller.initialize();
       await _controller?.dispose();
       _controller = controller;
+      await controller.initialize();
       final image = await controller.takePicture();
       final imageBytes = await image.readAsBytes();
 
@@ -40,6 +40,8 @@ class VisionService {
       );
     } catch (error) {
       return VisionCheckResult(ok: false, label: '看不到', detail: '$error');
+    } finally {
+      await stop();
     }
   }
 
